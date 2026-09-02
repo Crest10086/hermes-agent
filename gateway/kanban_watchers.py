@@ -49,6 +49,81 @@ def _safe_review_reason(value: Any, limit: int = 160) -> str:
     return reason
 
 
+def _is_transient_delivery_failure(exc: Exception) -> bool:
+    """True when a delivery error is a transient rate-limit (iLink -2).
+
+    A rate-limited send (``iLink sendmessage rate limited; cooldown active``)
+    is *temporary*: iLink accepts once its window resets, so it must NOT count
+    toward the drop threshold. Only permanent, unrecoverable failures (chat
+    not found / session expired / authz revoked) may drop a subscription after
+    ``MAX_SEND_FAILURES`` consecutive attempts. Matching is intentionally
+    loose — the exact iLink wording varies between the cooldown path and the
+    ``ret=-2`` path.
+    """
+    msg = str(exc).lower()
+    return "rate limited" in msg or "rate-limit" in msg or "cooldown" in msg
+
+
+def _notice_cache_dir() -> str:
+    """Resolve the kanban-notice cache directory (created lazily)."""
+    from hermes_constants import get_hermes_home
+
+    return os.path.join(str(get_hermes_home()), "cache", "kanban-notices")
+
+
+def _fileify_long_notice(
+    full_text: str,
+    task_id: str,
+    ts: float,
+    *,
+    threshold: int,
+    preview_len: int = 500,
+    cache_dir: Optional[str] = None,
+) -> "tuple[str, Optional[str]]":
+    """When ``full_text`` is longer than ``threshold``, it is a wall of text in
+    a mobile chat. Write the full text to ``<cache_dir>/<task_id>-<ts>.md`` and
+    return a short preview plus that file path for a ``send_document``.
+
+    Returns ``(full_text, None)`` when the text fits within the threshold, so
+    short notifications keep their existing single-message path.
+    """
+    if not full_text or len(full_text) <= threshold:
+        return full_text, None
+    cache_dir = cache_dir or _notice_cache_dir()
+    os.makedirs(cache_dir, exist_ok=True)
+    fname = f"{task_id}-{int(ts)}.md"
+    path = os.path.join(cache_dir, fname)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(full_text)
+    preview = full_text[:preview_len].rstrip()
+    send_text = f"{preview}\n\n…完整报告见附件"
+    return send_text, path
+
+
+def _fetch_completed_run_summary(board, task_id: str) -> "Optional[str]":
+    """Return the full summary from the task's most recent completed run.
+
+    The ``completed`` event payload only carries the first line capped at 400
+    chars (see ``complete_task``); the full handoff summary lives on
+    ``task_runs``. Long-notice file-ification (requirement D) needs this full
+    text to decide whether to ship the notice as a .md document. Opens its own
+    connection because the notifier's per-tick worker runs after ``_collect``
+    has closed the board connection.
+    """
+    from hermes_cli import kanban_db as _kb
+
+    conn = _kb.connect(board=board)
+    try:
+        row = conn.execute(
+            "SELECT summary FROM task_runs WHERE task_id = ? AND outcome = 'completed' "
+            "AND summary IS NOT NULL AND summary != '' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    return row["summary"] if row else None
+
+
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
 ) -> "tuple[bool, int]":
@@ -289,6 +364,13 @@ class GatewayKanbanWatchersMixin:
         # A genuinely dead chat still drops, just ~60s later — a fine trade
         # for an unattended gate where a false drop means silent work pileup.
         MAX_SEND_FAILURES = 12
+        # Long-notice file threshold (requirement D). When a notification's
+        # full body exceeds this many chars, the notifier writes it to a .md
+        # document and sends a short preview + the file instead of a wall of
+        # text on a phone. Adjustable via env KANBAN_NOTICE_FILE_THRESHOLD /
+        # KANBAN_NOTICE_PREVIEW_LEN.
+        NOTICE_FILE_THRESHOLD = int(os.getenv("KANBAN_NOTICE_FILE_THRESHOLD", "1200"))
+        NOTICE_PREVIEW_LEN = int(os.getenv("KANBAN_NOTICE_PREVIEW_LEN", "500"))
         sub_fail_counts: dict[tuple, int] = getattr(
             self, "_kanban_sub_fail_counts", {}
         )
@@ -578,6 +660,10 @@ class GatewayKanbanWatchersMixin:
                         # chat subscribes to many tasks) legible at a glance.
                         who = (task.assignee if task and task.assignee else None)
                         tag = f"@{who} " if who else ""
+                        # Long-form notice body: set by the ``completed`` branch
+                        # to the full summary, and used at the send site to
+                        # decide whether to ship the text as a .md document.
+                        notice_full = None
                         if kind == "completed":
                             # Prefer the run's summary (the worker's
                             # intentional human-facing handoff, carried
@@ -593,11 +679,23 @@ class GatewayKanbanWatchersMixin:
                                 h = lines[0][:200] if lines else payload_summary[:200]
                                 handoff = f"\n{h}"
                                 wake_handoff = h
+                                # Full summary is the long-form notice: if it
+                                # exceeds the file threshold, ship it as a .md
+                                # document plus a short preview (requirement D).
+                                # The event payload caps the summary at 400
+                                # chars, so prefer the full run-summary text.
+                                notice_full = (
+                                    _fetch_completed_run_summary(
+                                        board_slug, sub["task_id"],
+                                    )
+                                    or payload_summary
+                                )
                             elif task and task.result:
                                 lines = task.result.strip().splitlines()
                                 r = lines[0][:160] if lines else task.result[:160]
                                 handoff = f"\n{r}"
                                 wake_handoff = r
+                                notice_full = task.result
                             msg = (
                                 f"✔ {board_tag}{tag}Kanban {sub['task_id']} done"
                                 f" — {title}{handoff}"
@@ -739,9 +837,23 @@ class GatewayKanbanWatchersMixin:
                             # is resolved (reset or bumped) by the wake
                             # outcome there, not by skipping the send here.
                             continue
+                        # Requirement D: if the long-form notice (full summary)
+                        # exceeds the file threshold, ship it as a .md document
+                        # instead of a wall of text on a phone. Short notices
+                        # keep the existing single-message path verbatim.
+                        send_text = msg
+                        notice_file: Optional[str] = None
+                        if notice_full and len(notice_full) > NOTICE_FILE_THRESHOLD:
+                            send_text, notice_file = _fileify_long_notice(
+                                notice_full,
+                                sub["task_id"],
+                                time.time(),
+                                threshold=NOTICE_FILE_THRESHOLD,
+                                preview_len=NOTICE_PREVIEW_LEN,
+                            )
                         try:
                             _send_res = await adapter.send(
-                                sub["chat_id"], msg, metadata=metadata,
+                                sub["chat_id"], send_text, metadata=metadata,
                             )
                             # A SendResult(success=False) without an exception
                             # (returned by push-capable adapters on a genuine
@@ -755,6 +867,15 @@ class GatewayKanbanWatchersMixin:
                                     "adapter send() reported failure: "
                                     f"{getattr(_send_res, 'error', None) or 'unknown error'}"
                                 )
+                            if notice_file:
+                                _file_res = await adapter.send_document(
+                                    sub["chat_id"], notice_file, metadata=metadata,
+                                )
+                                if getattr(_file_res, "success", True) is False:
+                                    raise RuntimeError(
+                                        "adapter send_document() reported failure: "
+                                        f"{getattr(_file_res, 'error', None) or 'unknown error'}"
+                                    )
                             logger.debug(
                                 "kanban notifier: delivered %s event for %s to %s/%s on board %s",
                                 kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,
@@ -785,6 +906,21 @@ class GatewayKanbanWatchersMixin:
                             # Reset the failure counter on success.
                             sub_fail_counts.pop(sub_key, None)
                         except Exception as exc:
+                            if _is_transient_delivery_failure(exc):
+                                logger.warning(
+                                    "kanban notifier: transient send failure "
+                                    "for %s on %s (rate limited; rewinding for "
+                                    "retry): %s",
+                                    sub["task_id"], platform_str, exc,
+                                )
+                                await _to_thread_process_service(
+                                    self._kanban_rewind,
+                                    sub,
+                                    d["cursor"],
+                                    d.get("old_cursor", 0),
+                                    board_slug,
+                                )
+                                break
                             fails = sub_fail_counts.get(sub_key, 0) + 1
                             sub_fail_counts[sub_key] = fails
                             logger.warning(
@@ -928,6 +1064,21 @@ class GatewayKanbanWatchersMixin:
                                 )
                                 sub_fail_counts.pop(sub_key, None)
                             except Exception as _wk_err:
+                                if _is_transient_delivery_failure(_wk_err):
+                                    logger.warning(
+                                        "kanban notifier: transient wake self-post "
+                                        "failure for %s (rate limited; rewinding "
+                                        "for retry): %s",
+                                        sub["task_id"], _wk_err,
+                                    )
+                                    await _to_thread_process_service(
+                                        self._kanban_rewind,
+                                        sub,
+                                        d["cursor"],
+                                        d.get("old_cursor", 0),
+                                        board_slug,
+                                    )
+                                    continue
                                 fails = sub_fail_counts.get(sub_key, 0) + 1
                                 sub_fail_counts[sub_key] = fails
                                 logger.warning(
@@ -1028,6 +1179,21 @@ class GatewayKanbanWatchersMixin:
                                 await _push_wake()
                                 sub_fail_counts.pop(sub_key, None)
                             except Exception as _wk_err:
+                                if _is_transient_delivery_failure(_wk_err):
+                                    logger.warning(
+                                        "kanban notifier: transient wake-only "
+                                        "delivery failure for %s (rate limited; "
+                                        "rewinding for retry): %s",
+                                        sub["task_id"], _wk_err,
+                                    )
+                                    await _to_thread_process_service(
+                                        self._kanban_rewind,
+                                        sub,
+                                        d["cursor"],
+                                        d.get("old_cursor", 0),
+                                        board_slug,
+                                    )
+                                    continue
                                 fails = sub_fail_counts.get(sub_key, 0) + 1
                                 sub_fail_counts[sub_key] = fails
                                 logger.warning(
