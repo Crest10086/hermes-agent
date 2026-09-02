@@ -74,15 +74,22 @@ def _notice_cache_dir() -> str:
 def _fileify_long_notice(
     full_text: str,
     task_id: str,
-    ts: float,
+    event_id: int,
     *,
     threshold: int,
     preview_len: int = 500,
     cache_dir: Optional[str] = None,
 ) -> "tuple[str, Optional[str]]":
     """When ``full_text`` is longer than ``threshold``, it is a wall of text in
-    a mobile chat. Write the full text to ``<cache_dir>/<task_id>-<ts>.md`` and
-    return a short preview plus that file path for a ``send_document``.
+    a mobile chat. Write the full text to ``<cache_dir>/<task_id>-<event_id>.md``
+    and return a short preview plus that file path for a ``send_document``.
+
+    The filename is keyed on the STABLE task-event id, not a wall-clock
+    timestamp: A's transient-failure rewind re-enters this function on every
+    retry tick, and a per-call ``time.time()`` name would drop a fresh
+    duplicate .md (identical content, new name) into the cache dir for as
+    long as iLink stays rate-limited — one e2e run left 128 files. Keying on
+    ``event_id`` makes retries overwrite the same file.
 
     Returns ``(full_text, None)`` when the text fits within the threshold, so
     short notifications keep their existing single-message path.
@@ -91,7 +98,7 @@ def _fileify_long_notice(
         return full_text, None
     cache_dir = cache_dir or _notice_cache_dir()
     os.makedirs(cache_dir, exist_ok=True)
-    fname = f"{task_id}-{int(ts)}.md"
+    fname = f"{task_id}-{int(event_id)}.md"
     path = os.path.join(cache_dir, fname)
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(full_text)
@@ -844,10 +851,15 @@ class GatewayKanbanWatchersMixin:
                         send_text = msg
                         notice_file: Optional[str] = None
                         if notice_full and len(notice_full) > NOTICE_FILE_THRESHOLD:
+                            # Key the .md filename on the stable event id (not
+                            # a timestamp) so A's transient-failure rewind,
+                            # which re-runs this send site every retry tick,
+                            # overwrites one file instead of dropping a fresh
+                            # duplicate per tick.
                             send_text, notice_file = _fileify_long_notice(
                                 notice_full,
                                 sub["task_id"],
-                                time.time(),
+                                ev.id,
                                 threshold=NOTICE_FILE_THRESHOLD,
                                 preview_len=NOTICE_PREVIEW_LEN,
                             )

@@ -1,4 +1,5 @@
 import asyncio
+import os
 
 from gateway.config import Platform
 from gateway.kanban_watchers import _fileify_long_notice
@@ -169,17 +170,42 @@ def test_fileify_long_notice_writes_document_matching_original(tmp_path):
     send_text, path = _fileify_long_notice(
         LONG_SUMMARY,
         "t_82ffe3e3",
-        1788357673.0,
+        987654,  # stable task-event id (int), not a wall-clock ts
         threshold=1200,
         cache_dir=str(tmp_path),
     )
     assert path is not None
     assert path.endswith(".md")
+    # Filename keyed on the STABLE event id: A's transient-failure rewind
+    # re-runs the send site every retry tick and must overwrite ONE file,
+    # not drop a fresh duplicate per tick (one e2e run left 128 files).
+    assert os.path.basename(path) == "t_82ffe3e3-987654.md"
     with open(path, encoding="utf-8") as fh:
         assert fh.read() == LONG_SUMMARY
     assert send_text.startswith(LONG_SUMMARY[:500])
     assert "…完整报告见附件" in send_text
     assert len(send_text) < len(LONG_SUMMARY)
+
+
+def test_fileify_retry_same_event_id_overwrites_not_duplicates(tmp_path):
+    # Regression for the 128-duplicate-file bug: retrying the SAME event
+    # (transient rate-limit rewind) keeps exactly one .md; a NEW event id
+    # (a genuinely new completion) gets its own file. Only .md files are
+    # asserted on — conftest's autouse fixture drops other entries here.
+    for _ in range(5):  # simulate five retry ticks, same event id
+        _, path = _fileify_long_notice(
+            LONG_SUMMARY, "t_82ffe3e3", 987654, threshold=1200,
+            cache_dir=str(tmp_path),
+        )
+    md_files = [f for f in os.listdir(tmp_path) if f.endswith(".md")]
+    assert md_files == ["t_82ffe3e3-987654.md"], md_files
+    # A different event id (a new completion) gets its own file.
+    _, path2 = _fileify_long_notice(
+        LONG_SUMMARY, "t_82ffe3e3", 987655, threshold=1200, cache_dir=str(tmp_path),
+    )
+    assert os.path.basename(path2) == "t_82ffe3e3-987655.md"
+    md_files = [f for f in os.listdir(tmp_path) if f.endswith(".md")]
+    assert len(md_files) == 2, md_files
 
 
 def test_fileify_long_notice_keeps_short_text_unchanged(tmp_path):
