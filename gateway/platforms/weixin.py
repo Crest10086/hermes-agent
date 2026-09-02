@@ -858,6 +858,13 @@ def _looks_like_chatty_line_for_weixin(line: str) -> bool:
         return False
     if re.match(r"^\d+\.\s", stripped):
         return False
+    # A line carrying inline markdown (backticks or ``**bold**``) is a
+    # structured payload (e.g. a ``/model`` list line of provider+models), not
+    # a bare chat utterance. Treating it as chatty made a 5-line ``/model``
+    # listing split into 5 bubbles. Any markdown-looking line votes the whole
+    # block non-chatty so it ships as a single message (requirement E).
+    if "`" in stripped or "**" in stripped:
+        return False
     return True
 
 
@@ -1209,21 +1216,45 @@ class WeixinAdapter(BasePlatformAdapter):
             extra.get("send_chunk_retry_delay_seconds")
             or os.getenv("WEIXIN_SEND_CHUNK_RETRY_DELAY_SECONDS", "1.0")
         )
-        self._send_text_gate = asyncio.Lock()
+        self._send_gates: Dict[str, asyncio.Lock] = {}
+        self._user_last_send: Dict[str, float] = {}
+        # Per-user minimum interval between successful sends (requirement C).
+        # Serializes same-user traffic so multi-subscription / multi-cron
+        # bursts can't all hit iLink for one user at once, WITHOUT blocking
+        # sends to other users. Tunable via config.extra
+        # ``send_user_min_interval_seconds`` or env
+        # ``WEIXIN_SEND_USER_MIN_INTERVAL_SECONDS``.
+        self._send_user_min_interval_seconds = self._coerce_float_extra_or_env(
+            "send_user_min_interval_seconds",
+            "WEIXIN_SEND_USER_MIN_INTERVAL_SECONDS",
+            5.0,
+        )
         self._rate_limit_circuit_threshold = max(
             1,
             int(
-                extra.get("rate_limit_circuit_threshold")
-                or os.getenv("WEIXIN_RATE_LIMIT_CIRCUIT_THRESHOLD", "1")
+                self._coerce_float_extra_or_env(
+                    "rate_limit_circuit_threshold",
+                    "WEIXIN_RATE_LIMIT_CIRCUIT_THRESHOLD",
+                    1.0,
+                )
             ),
         )
-        self._rate_limit_circuit_window_seconds = float(
-            extra.get("rate_limit_circuit_window_seconds")
-            or os.getenv("WEIXIN_RATE_LIMIT_CIRCUIT_WINDOW_SECONDS", "30.0")
+        self._rate_limit_circuit_window_seconds = self._coerce_float_extra_or_env(
+            "rate_limit_circuit_window_seconds",
+            "WEIXIN_RATE_LIMIT_CIRCUIT_WINDOW_SECONDS",
+            30.0,
         )
-        self._rate_limit_circuit_open_seconds = float(
-            extra.get("rate_limit_circuit_open_seconds")
-            or os.getenv("WEIXIN_RATE_LIMIT_CIRCUIT_OPEN_SECONDS", "30.0")
+        # iLink's server-side window is >64s (measured). A local breaker that
+        # opened at 30s was SHORTER than the real window, so every retry during
+        # the server cooldown immediately re-opened the local breaker and the
+        # notifier burned 12 attempts into a wall. Default to 90s so the local
+        # cooldown outlasts the server window. Overridable via config.extra
+        # ``rate_limit_circuit_open_seconds`` or env
+        # ``WEIXIN_RATE_LIMIT_CIRCUIT_OPEN_SECONDS``.
+        self._rate_limit_circuit_open_seconds = self._coerce_float_extra_or_env(
+            "rate_limit_circuit_open_seconds",
+            "WEIXIN_RATE_LIMIT_CIRCUIT_OPEN_SECONDS",
+            90.0,
         )
         self._rate_limit_circuit_until = 0.0
         self._rate_limit_events: List[float] = []
@@ -1275,6 +1306,29 @@ class WeixinAdapter(BasePlatformAdapter):
         import math
 
         value = self.config.extra.get(key) if getattr(self.config, "extra", None) else None
+        if value is None:
+            return float(default)
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return float(default)
+        if not math.isfinite(parsed) or parsed < 0:
+            return float(default)
+        return parsed
+
+    def _coerce_float_extra_or_env(self, key: str, env_key: str, default: float) -> float:
+        """Read a non-negative float from ``config.extra`` or an env var.
+
+        Same tolerance as :meth:`_coerce_float_extra` (bad/non-finite/negative
+        falls back to ``default``) but also honours an env override, so the
+        iLink circuit and per-user throttle can be tuned without editing
+        config.yaml. ``extra`` wins over ``env``.
+        """
+        import math
+
+        value = self.config.extra.get(key) if getattr(self.config, "extra", None) else None
+        if value is None:
+            value = os.getenv(env_key)
         if value is None:
             return float(default)
         try:
@@ -1791,6 +1845,20 @@ class WeixinAdapter(BasePlatformAdapter):
         self._rate_limit_events.clear()
         self._rate_limit_circuit_until = 0.0
 
+    async def _wait_for_user_slot(self, user_id: str) -> None:
+        """Wait until ``send_user_min_interval_seconds`` have elapsed since the
+        last successful send to ``user_id``.
+
+        Runs under the per-user gate (``_send_gates``) so it only delays
+        further sends to the *same* user — other users proceed concurrently.
+        A per-user ``asyncio.sleep`` here is fine precisely because the gate is
+        per-user, not adapter-wide.
+        """
+        last = self._user_last_send.get(user_id, 0.0)
+        need = last + self._send_user_min_interval_seconds - time.monotonic()
+        if need > 0:
+            await asyncio.sleep(need)
+
     async def _send_text_chunk(
         self,
         *,
@@ -1801,18 +1869,22 @@ class WeixinAdapter(BasePlatformAdapter):
     ) -> None:
         """Send a single text chunk with per-chunk retry and backoff.
 
+        Called while the caller (``send()``) holds the per-user send gate, so
+        concurrency is already serialized per ``user_id``; the per-chunk retry
+        and iLink rate-limit backoff below run inside that gate without
+        blocking other users.
+
         On session-expired errors (errcode -14), automatically retries
         *without* ``context_token`` — iLink accepts tokenless sends as a
         degraded fallback, which keeps cron-initiated push messages working
         even when no user message has refreshed the session recently.
         """
-        async with self._send_text_gate:
-            await self._send_text_chunk_locked(
-                chat_id=chat_id,
-                chunk=chunk,
-                context_token=context_token,
-                client_id=client_id,
-            )
+        await self._send_text_chunk_locked(
+            chat_id=chat_id,
+            chunk=chunk,
+            context_token=context_token,
+            client_id=client_id,
+        )
 
     async def _send_text_chunk_locked(
         self,
@@ -1919,6 +1991,28 @@ class WeixinAdapter(BasePlatformAdapter):
     ) -> SendResult:
         if not self._send_session or not self._token:
             return SendResult(success=False, error="Not connected")
+        # Per-user gate + throttle (requirement C): serialize sends to the SAME
+        # user and enforce a minimum interval between successful sends, WITHOUT
+        # blocking other users. Multi-subscription / multi-cron bursts that all
+        # target one user would otherwise trip iLink's -2 rate limit.
+        gate = self._send_gates.setdefault(chat_id, asyncio.Lock())
+        async with gate:
+            await self._wait_for_user_slot(chat_id)
+            return await self._send_after_gate(
+                chat_id=chat_id,
+                content=content,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+
+    async def _send_after_gate(
+        self,
+        *,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+    ) -> SendResult:
         context_token = self._token_store.get(self._account_id, chat_id)
         last_message_id: Optional[str] = None
 
@@ -1972,6 +2066,7 @@ class WeixinAdapter(BasePlatformAdapter):
                 last_message_id = client_id
                 if idx < len(chunks) - 1 and self._send_chunk_delay_seconds > 0:
                     await asyncio.sleep(self._send_chunk_delay_seconds)
+            self._user_last_send[chat_id] = time.monotonic()
             return SendResult(success=True, message_id=last_message_id)
         except Exception as exc:
             logger.error("[%s] send failed to=%s: %s", self.name, _safe_id(chat_id), exc)
