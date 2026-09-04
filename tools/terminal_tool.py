@@ -161,7 +161,7 @@ Do NOT use cat/head/tail (use read_file), grep/rg/find/ls (use search_files), se
 Environment state persists: activate a virtualenv or export variables once per session, not before every command.
 
 Foreground (default): returns INSTANTLY when the command finishes, even with a high timeout — set timeout generously for long builds.
-Background: set background=true (returns a session_id); add notify=true for bounded tasks, leave silent only for servers/daemons that never exit. After starting a server, verify readiness with a health check in a separate call (no blind sleep loops); manage with process(action="poll"/"wait").
+Background: bounded long tasks MUST use background=true AND notify=true together. Silent background only for servers that never exit. After starting a server, verify readiness with a health check in a separate call (no blind sleep loops); manage with process(action="poll"/"wait").
 Working directory: use 'workdir' for per-command cwd; when a command changes the session cwd (cd, pushd), trust the result's "cwd" field instead of prefixing every command with 'cd'.
 PTY: pty=true + background=true for interactive CLIs (they hang without a terminal); drive them with process(action="write"/"submit"). Local backend only.
 """
@@ -1266,7 +1266,7 @@ TERMINAL_SCHEMA = {
             },
             "background": {
                 "type": "boolean",
-                "description": "Run in the background, returning a session_id. Pair with notify=true for anything with a defined end (tests, builds, deploys) — without it the process runs silently. Only servers/watchers/daemons that never exit should stay silent. Short commands: prefer foreground with a generous timeout.",
+                "description": "REQUIRED if notify is set. notify=true/list without background=true is invalid — always send both. Pair notify=true with background=true for bounded tasks (tests, builds, deploys). Silent background only for servers that never exit. Short commands: foreground + high timeout.",
                 "default": False
             },
             "timeout": {
@@ -1284,7 +1284,7 @@ TERMINAL_SCHEMA = {
                 "default": False
             },
             "notify": {
-                "description": "With background=true: notify=true fires exactly one notification when the process exits (the right choice for nearly every bounded task — builds, tests, deploys). notify=['pattern', ...] instead notifies when a line matches a pattern — ONLY for one-shot readiness signals on processes that never exit (e.g. ['Application startup complete']); rate-limited and auto-disabled if it over-fires. Omit for silent daemons.",
+                "description": "Requires background=true. notify=true: one notification when the process exits (builds/tests/deploys). notify=['pattern', ...]: notify on a rare readiness line for daemons that never exit. Omit for silent servers.",
                 "anyOf": [
                     {"type": "boolean"},
                     {"type": "array", "items": {"type": "string"}}
@@ -1315,13 +1315,12 @@ def _handle_terminal(args, **kw):
     notify = args.get("notify")
     notify_on_complete = args.get("notify_on_complete", False)
     watch_patterns = args.get("watch_patterns")
+    # A foreground call with a notify modifier was the classic mis-send:
+    # auto-promote to background instead of erroring (the model clearly
+    # wanted a notification, which implies it expected a background run).
     if not args.get("background", False):
         if notify or watch_patterns or notify_on_complete:
-            return tool_error(
-                "notify only applies to background commands (foreground "
-                "results return directly). Either drop notify, or run as "
-                "terminal(command=..., background=true, notify=...)."
-            )
+            args["background"] = True
         if args.get("pty", False):
             return tool_error(
                 "pty requires background=true (a PTY session is interacted "
