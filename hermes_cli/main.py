@@ -1078,7 +1078,11 @@ def _confirm_startup_expensive_model_override(args) -> None:
 
     # Intentionally independent of --yolo / --accept-hooks: those approve local
     # command risk, not paid aggregator spend or a surprising provider route.
-    is_interactive = sys.stdin.isatty()
+    # NOTE (local carry, 2026-09-07): on Windows/MSYS + service-spawned workers
+    # sys.stdin.isatty() is True even with stdin=DEVNULL, so the flag below
+    # could never fire for kanban workers. HERMES_KANBAN_TASK is set by the
+    # dispatcher on every worker spawn — treat its presence as unattended.
+    is_interactive = sys.stdin.isatty() and "HERMES_KANBAN_TASK" not in os.environ
     if not is_interactive and security_cfg.get("allow_data_training_tiers_noninteractive") is True:
         acknowledged = [w for w in warnings if w.kind == "data_policy"]
         if acknowledged:
