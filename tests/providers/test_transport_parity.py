@@ -182,4 +182,6 @@ class TestCustomOllamaParity:
             base_url="https://api.mistral.ai/v1",
         )
         assert kw.get("extra_body", {}).get("think") is None
-        assert kw.get("reasoning_effort") == "none"
+        # Regression t_91f9aae7: non-Ollama custom endpoints must not receive
+        # top-level reasoning_effort="none" (EXL3-class 400 on the literal).
+        assert "reasoning_effort" not in kw

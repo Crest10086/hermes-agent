@@ -1,14 +1,18 @@
 """Unit tests for the custom provider profile's reasoning wiring.
 
 ``provider=custom`` covers any OpenAI-compatible endpoint the user points
-Hermes at — local Ollama, vLLM, llama.cpp, and hosted reasoning APIs like
-GLM-5.2 on Volcengine ARK. Before #57601's salvage, ``CustomProfile`` emitted
-nothing when reasoning was *enabled*, so a configured ``reasoning_effort``
-was silently dropped for every custom endpoint.
+Hermes at — local Ollama, vLLM, llama.cpp, EXL3 relays (new-api), and hosted
+reasoning APIs like GLM-5.2 on Volcengine ARK. Before #57601's salvage,
+``CustomProfile`` emitted nothing when reasoning was *enabled*, so a configured
+``reasoning_effort`` was silently dropped for every custom endpoint.
 
 These tests pin the wire-shape contract:
     - disabled on Ollama  → extra_body.think = False + reasoning_effort=none
-    - disabled elsewhere  → reasoning_effort=none, no think (strict APIs 422)
+    - disabled elsewhere  → NOTHING emitted (server default applies). Top-level
+                          ``reasoning_effort="none"`` 400s on strict
+                          OpenAI-compat backends (EXL3: "Supported types are
+                          xhigh (default), medium, and low"), so the literal
+                          must never be forwarded to a non-Ollama endpoint.
     - enabled + effort    → top-level reasoning_effort (native OpenAI-compat
                           format GLM/ARK expect), passed through verbatim
                           including ``max``/``xhigh``
@@ -75,23 +79,26 @@ class TestCustomReasoningWireShape:
         assert eb == {"think": False}
         assert tl == {"reasoning_effort": "none"}
 
-    def test_disabled_omits_think_on_mistral(self, custom_profile):
-        """Strict OpenAI-compat hosts forbid extra ``think`` (HTTP 422)."""
+    def test_disabled_omits_none_on_mistral(self, custom_profile):
+        """Strict OpenAI-compat hosts forbid extra ``think`` AND top-level
+        ``reasoning_effort="none"`` (EXL3/Mistral-class 400 on the literal).
+        Disabled outside Ollama → omit everything; server default applies.
+        """
         eb, tl = custom_profile.build_api_kwargs_extras(
             reasoning_config={"enabled": True, "effort": "none"},
             model="mistral-small-latest",
             base_url="https://api.mistral.ai/v1",
         )
         assert "think" not in eb
-        assert tl == {"reasoning_effort": "none"}
+        assert tl == {}
 
-    def test_disabled_omits_think_without_base_url(self, custom_profile):
-        """Unknown custom endpoint — do not send the Ollama-only flag."""
+    def test_disabled_omits_none_without_base_url(self, custom_profile):
+        """Unknown custom endpoint — do not guess; never forward ``none``."""
         eb, tl = custom_profile.build_api_kwargs_extras(
             reasoning_config={"enabled": False}, model="glm-5.2"
         )
         assert "think" not in eb
-        assert tl == {"reasoning_effort": "none"}
+        assert tl == {}
 
     @pytest.mark.parametrize(
         "base_url",
@@ -101,14 +108,30 @@ class TestCustomReasoningWireShape:
             "https://api.groq.com/openai/v1",
         ],
     )
-    def test_disabled_omits_think_on_non_ollama_relays(self, custom_profile, base_url):
+    def test_disabled_omits_none_on_non_ollama_relays(self, custom_profile, base_url):
+        """vLLM/llama.cpp/EXL3 relays reject ``none``; omitting is the only
+        shape that never 400s."""
         eb, tl = custom_profile.build_api_kwargs_extras(
             reasoning_config={"effort": "none"},
             model="llama3",
             base_url=base_url,
         )
         assert "think" not in eb
-        assert tl == {"reasoning_effort": "none"}
+        assert tl == {}
+
+    def test_disabled_omits_none_on_exl3_relay(self, custom_profile):
+        """Regression #t_91f9aae7: custom:new-api→EXL3 crashed with HTTP 400
+        `TemplateError: Unexpected reasoning effort none. Supported types are
+        xhigh (default), medium, and low.` — the top-level literal must not
+        reach an EXL3-class endpoint."""
+        eb, tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": False, "effort": "none"},
+            model="local-main",
+            base_url="http://127.0.0.1:3140/v1",
+        )
+        assert "think" not in eb
+        assert "reasoning_effort" not in tl
+        assert tl == {}
 
     def test_disabled_sends_think_false_on_ollama_cloud_host(self, custom_profile):
         eb, tl = custom_profile.build_api_kwargs_extras(
@@ -133,7 +156,7 @@ class TestCustomReasoningWireShape:
         The OpenAI client accepts ``http://myhost:99999/v1`` at construction
         (only httpx fails later), so these URLs reach ``build_api_kwargs_extras``
         in production. The heuristic must treat them as non-Ollama rather than
-        killing the kwargs build.
+        killing the kwargs build — and never forward ``none``.
         """
         eb, tl = custom_profile.build_api_kwargs_extras(
             reasoning_config={"enabled": False},
@@ -141,7 +164,7 @@ class TestCustomReasoningWireShape:
             base_url=base_url,
         )
         assert "think" not in eb
-        assert tl == {"reasoning_effort": "none"}
+        assert tl == {}
 
     @pytest.mark.parametrize(
         "effort", ["minimal", "low", "medium", "high", "xhigh", "max"]
@@ -179,4 +202,3 @@ class TestCustomReasoningWithNumCtx:
         )
         assert eb == {"options": {"num_ctx": 8192}}
         assert tl == {}
-

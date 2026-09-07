@@ -45,9 +45,16 @@ class CustomProfile(ProviderProfile):
         if reasoning_config and isinstance(reasoning_config, dict):
             effort = (reasoning_config.get("effort") or "").strip().lower()
             if effort == "none" or reasoning_config.get("enabled", True) is False:
-                # See #14820.
-                top_level["reasoning_effort"] = "none"
+                # Ollama /v1 honors top-level reasoning_effort="none" (see
+                # #14820/#25758) — keep the disable pair there. NON-Ollama
+                # OpenAI-compat backends (EXL3, strict relays, vLLM, llama.cpp)
+                # reject the literal with HTTP 400 ("Unexpected reasoning
+                # effort none"); omit the field so their server default
+                # applies. Never forward "none" outside Ollama (#t_91f9aae7:
+                # custom:new-api→EXL3 crashed on the disabled continuation
+                # request emitted by the nudge / thinking-only-truncation path).
                 if _looks_like_ollama_endpoint(ctx.get("base_url")):
+                    top_level["reasoning_effort"] = "none"
                     extra_body["think"] = False
             elif effort:
                 top_level["reasoning_effort"] = clamp_effort(effort, OPENAI_COMPAT_WIRE_EFFORTS)
