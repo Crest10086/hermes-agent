@@ -262,6 +262,8 @@ What happens:
 
 The canonical flow: your main agent opens a PR, you type `/review`, and a second pair of eyes investigates it while you keep working; the review lands back in the chat addressed to the agent that created the PR.
 
+Dispatch prints only “Review started. Results will return here.” The live subagent viewer identifies the worker as **Review: your focus** (or **Review recent work** for bare `/review`), with a shortened single-line label; the reviewer still receives your full instructions. In the classic CLI, the dock above the composer shows elapsed time and latest activity; **F6** opens the roster with its model, transcript, steering, and stop controls. The same review label appears in the TUI and Desktop subagent viewers.
+
 ### Review model
 
 By default the reviewer runs on your main model. To pin a dedicated review model, set `auxiliary.review` in `config.yaml`:
@@ -392,10 +394,12 @@ The classic CLI, TUI, and Desktop automatically show live subagents above the co
 | Surface | Expand and inspect | Control a selected worker |
 |---|---|---|
 | Classic CLI | **F6** opens the full-screen live roster; arrows select, **Enter** opens the transcript tail, **PgUp/PgDn** scroll | **s** opens a separate steering input; **x**, then **y** requests stop |
-| TUI | **Ctrl+T** or `/agents` opens the full-height tree; **Enter** opens detail; **t** opens the live transcript tail | **e** opens steering; **x** stops the selected worker; **X** stops its subtree |
+| TUI | **Ctrl+T** or `/agents` opens the full-height tree; **Enter/t** opens the live transcript tail; **d** opens rich detail (archived/replay Enter still opens detail) | **e** opens steering; **x** stops the selected worker; **X** stops its subtree |
 | Desktop | Expand **Subagents** above the composer, then select a worker to inspect its activity and details | **Steer** queues guidance; **Stop** requests interruption for that worker |
 
 Closing the terminal monitor returns to your existing composer draft. Steering uses its own input and acknowledges **queued**, not delivery: the child consumes guidance at a checkpoint. Stop does not interrupt unrelated siblings.
+
+Press **F7** in the Classic CLI or TUI composer to toggle the dock between its multi-row preview and a single shaded summary line. The summary retains the live count and expand/restore hints, adding activity when space permits. Typing and sending remain available; opening and closing the monitor preserves your draft and insertion point. This is a local presentation choice, not a saved config change.
 
 The live transcript tail is a bounded recent excerpt, not an unlimited conversation browser. A child leaving the live registry leaves the dock; completion messages and the TUI/Desktop history views remain the place to review finished work. Latest activity is an observation, not a percentage-complete estimate.
 
