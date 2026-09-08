@@ -669,7 +669,8 @@ class QQAdapter(BasePlatformAdapter):
         chat_type = parsed.get("chat_type", "")
         chat_id = parsed.get("chat_id", "")
         # DM session keys use chat_type "dm" (build_source for both c2c and
-        # guild channels); legacy "c2c" kept for pre-refactor session keys.        if chat_type in {"c2c", "dm"}:
+        # guild channels); legacy "c2c" kept for pre-refactor session keys.
+        if chat_type in {"c2c", "dm"}:
             return bool(chat_id) and operator == chat_id
         if chat_type in {"group", "guild"}:
             event_chat = str(event.group_openid or event.guild_id or "").strip()
