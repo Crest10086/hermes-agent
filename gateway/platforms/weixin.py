@@ -748,6 +748,9 @@ class WeixinAdapter(BasePlatformAdapter):
         # without blocking other users. Multi-subscription / multi-cron bursts
         # that all target one user would otherwise trip iLink's -2 rate limit.
         self._send_gates: Dict[str, asyncio.Lock] = {}
+        # Adapter-wide gate serializing the actual iLink text calls across users
+        # (used by _send_text_chunk); per-user _send_gates already serialize same-user traffic.
+        self._send_text_gate = asyncio.Lock()
         self._user_last_send: Dict[str, float] = {}
         self._send_user_min_interval_seconds = float(_extra_or_env(extra, "send_user_min_interval_seconds", "5.0"))
         self._rate_limit_circuit_threshold = max(1, int(_extra_or_env(extra, "rate_limit_circuit_threshold", "1")))
