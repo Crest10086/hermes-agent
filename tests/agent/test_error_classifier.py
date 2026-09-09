@@ -1638,3 +1638,70 @@ class TestServerInjectedParameterRejection:
         assert result.retryable is False
 
 
+KB_CACHE_FULL_MSG = (
+    "Job requires 968 pages (only 960 available) and cannot be enqueued. "
+    "Total cache allocated is 960 * 256 = 245760 tokens. "
+    "The request exceeds the available context size."
+)
+
+
+class TestKVCacheCapacityRejection:
+    """TabbyAPI / exllamav3 KV-cache capacity rejections carry the substring
+    'context size', which _CONTEXT_OVERFLOW_PATTERNS would route into
+    compression. The request is small, so compression cannot free cache pages;
+    the correct recovery is to back off (overloaded), not to delete history.
+    Regression guard for the local repro of the t_14951f7f patrol cron
+    (2026-09-09 15:02, 487-token 'Context length exceeded' after a KV-cache
+    capacity rejection)."""
+
+    def test_small_session_kv_cache_full_is_overloaded_not_overflow(self):
+        """status-less, ~7.3K prompt: must back off, never compress."""
+        e = MockAPIError(KB_CACHE_FULL_MSG, status_code=None, body={})
+        result = classify_api_error(
+            e, provider="custom", model="local-main",
+            approx_tokens=7346, context_length=245760, num_messages=1,
+        )
+        assert result.reason == FailoverReason.overloaded
+        assert result.retryable is True
+        assert result.should_compress is False
+
+    def test_small_session_kv_cache_full_via_400_stays_overloaded(self):
+        """The same rejection surfaced as a 400 must still be overloaded
+        (the generic-400 path and _400_TAIL_RULES would otherwise compress)."""
+        e = MockAPIError(KB_CACHE_FULL_MSG, status_code=400, body={})
+        result = classify_api_error(
+            e, provider="custom", model="local-main",
+            approx_tokens=7346, context_length=245760, num_messages=1,
+        )
+        assert result.reason == FailoverReason.overloaded
+        assert result.retryable is True
+        assert result.should_compress is False
+
+    def test_large_session_kv_cache_full_still_compresses(self):
+        """A genuinely large session with the same wording must keep the
+        context_overflow path (compression is correct there)."""
+        e = MockAPIError(KB_CACHE_FULL_MSG, status_code=None, body={})
+        result = classify_api_error(
+            e, provider="custom", model="local-main",
+            approx_tokens=180000, context_length=245760, num_messages=300,
+        )
+        assert result.reason == FailoverReason.context_overflow
+        assert result.should_compress is True
+
+    def test_plain_context_overflow_without_kv_signal_unchanged(self):
+        """A normal 'context length exceeded' rejection (no KV-cache capacity
+        signal) must still route to compression."""
+        e = MockAPIError(
+            "This model's maximum context length is 131072 tokens. However, "
+            "you requested 160000 tokens.",
+            status_code=400,
+            body={},
+        )
+        result = classify_api_error(
+            e, provider="custom", model="m",
+            approx_tokens=160000, context_length=131072, num_messages=40,
+        )
+        assert result.reason == FailoverReason.context_overflow
+        assert result.should_compress is True
+
+

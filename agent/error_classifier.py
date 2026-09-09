@@ -129,6 +129,21 @@ _OVERLOADED_PATTERNS = (
     "at capacity", "over capacity",
 )
 
+# TabbyAPI / exllamav3-style KV-cache capacity rejection. The engine reports a
+# page/context allocation failure whose "context size" substring (a member of
+# _CONTEXT_OVERFLOW_PATTERNS) would otherwise be matched as a context overflow —
+# but the request is small; compressing a tiny prompt cannot free KV cache
+# pages, and the real fix is to back off / shrink max_seq_len, not to delete
+# conversation history on a phantom overflow. Local repro: patrol-t cron for
+# t_14951f7f (15:02 on 2026-09-09):
+#   "Job requires 968 pages (only 960 available) and cannot be enqueued. Total
+#    cache allocated is 960 * 256 = 245760 tokens. The request exceeds the
+#    available context size."
+_KV_CACHE_CAPACITY_PATTERNS = (
+    "cannot be enqueued", "cache allocated", "pages (only",
+    "kvcache", "kv cache", "kv-cache", "cache is full", "cache slot",
+)
+
 # Usage-limit patterns that need disambiguation (billing OR rate_limit), and
 # the signals that mark such a limit as transient (periodic quota, not billing).
 _USAGE_LIMIT_PATTERNS = ("usage limit", "quota", "limit exceeded", "key limit exceeded")
@@ -539,6 +554,39 @@ def _by_error_code(c: _Ctx) -> Optional[Verdict]:
     return _ERROR_CODE_VERDICTS.get(c.code)
 
 
+def _kv_cache_capacity_verdict(c: _Ctx) -> Optional[Verdict]:
+    """Guard against server-side KV-cache capacity rejections being mistaken
+    for a context overflow.
+
+    TabbyAPI / exllamav3 report a page-allocation failure that contains the
+    overflow-flavored wording "…exceeds the available context size." Pattern
+    matching (``_CONTEXT_OVERFLOW_PATTERNS`` includes "context size") would
+    route that into compression — but the request is small, so compressing the
+    prompt cannot free KV-cache pages. The correct recovery is to back off and
+    retry once the engine frees pages (or lower max_seq_len), never to delete
+    conversation history on a phantom overflow.
+
+    Recognised only when the message carries an explicit KV-cache capacity
+    signal **and** the session is not genuinely large, so a real overflow on a
+    big session still routes to compression. Returns the ``overloaded`` verdict
+    (retryable, no compression) for a confirmed capacity rejection, else None.
+    """
+    msg = c.msg
+    if not any(p in msg for p in _KV_CACHE_CAPACITY_PATTERNS):
+        return None
+    if c.large_session(0.6, 120000, 200):
+        # The session is genuinely large; the engine may be reflecting a real
+        # overflow. Keep compression.
+        return None
+    # Small session + explicit KV-cache capacity wording → back off, don't compress.
+    logger.info(
+        "KV-cache capacity rejection (not context overflow): reason=%s approx_tokens=%d "
+        "context_length=%d num_messages=%d", _R.overloaded.value, c.approx_tokens,
+        c.context_length, c.num_messages,
+    )
+    return _V_OVERLOADED
+
+
 def _by_message(c: _Ctx) -> Optional[Verdict]:
     """Message patterns when no status code settled it; status-less usage
     limits get the same disambiguation as 402."""
@@ -596,7 +644,8 @@ def _by_status(c: _Ctx) -> Optional[Verdict]:
 # MoA shapes → structured error code → message patterns → SSL → disconnect +
 # large session → transport types → unknown (retryable with backoff).
 _STAGES: Sequence[Callable[[_Ctx], Optional[Verdict]]] = (
-    _plugin_verdict, _provider_special_cases, _by_status, _moa_special_cases,
+    _plugin_verdict, _provider_special_cases, _kv_cache_capacity_verdict,
+    _by_status, _moa_special_cases,
     _by_error_code, _by_message, _by_transport,
 )
 
