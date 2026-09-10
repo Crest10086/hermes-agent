@@ -520,7 +520,7 @@ def recover_after_classification(
     # it. One-shot: never send a disable again this session (the wire builder omits it → upstream
     # default thinking), queue a catalog refresh so the guard is right next time, retry.
     if (
-        classified.reason == FailoverReason.reasoning_mandatory
+        classified.reason == getattr(FailoverReason, "reasoning_mandatory", None)
         and not _retry.reasoning_mandatory_retry_attempted
     ):
         _retry.reasoning_mandatory_retry_attempted = True
