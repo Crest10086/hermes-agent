@@ -3217,16 +3217,28 @@ async def _dispose_unused_adapter(adapter: "BasePlatformAdapter | None") -> None
 
 
 # Max seconds between platform reconnect retries (primary watcher and secondary profiles share it).
-_RECONNECT_BACKOFF_CAP = 300
+_RECONNECT_BACKOFF_CAP = int(_float_env("HERMES_RECONNECT_CAP_SECONDS", 300))
 
 # Seconds continuously in the reconnect queue before NEEDS_ATTENTION. Retrying never stops (transient
 # outages must self-heal); this only makes a permanently-failing loop loud. 0 disables.
 _RECONNECT_ATTENTION_AFTER_SECONDS = _float_env("HERMES_RECONNECT_ATTENTION_AFTER_SECONDS", 7200)
 
+# Reconnect backoff shape. Default "exponential" preserves upstream behavior (30s, 60s, 120s, ...
+# capped). "constant" returns a flat HERMES_RECONNECT_BASE_SECONDS on every attempt — for
+# proxy-dependent platforms (Discord/QQ/Weixin behind a user-session v2rayN proxy that comes up
+# minutes AFTER a LocalSystem gateway service): exponential backoff skips past the proxy-availability
+# window (2026-09-05: proxy up 16:18, exponential retry jumped 16:17→16:21 and missed it).
+_RECONNECT_BACKOFF_MODE = os.environ.get("HERMES_RECONNECT_BACKOFF_MODE", "exponential").strip().lower()
+_RECONNECT_BACKOFF_BASE = int(_float_env("HERMES_RECONNECT_BASE_SECONDS", 30))
+
 
 def _reconnect_backoff(attempt: int) -> int:
-    """Exponential reconnect backoff: 30s, 60s, 120s, ... capped at 5 min."""
-    return min(30 * (2 ** (attempt - 1)), _RECONNECT_BACKOFF_CAP)
+    """Reconnect backoff. "constant" mode: flat HERMES_RECONNECT_BASE_SECONDS (poll frequently —
+    proxy-dependent platforms). "exponential" (default): base × 2^(attempt-1), capped at
+    HERMES_RECONNECT_CAP_SECONDS (upstream behavior)."""
+    if _RECONNECT_BACKOFF_MODE == "constant":
+        return _RECONNECT_BACKOFF_BASE
+    return min(_RECONNECT_BACKOFF_BASE * (2 ** (attempt - 1)), _RECONNECT_BACKOFF_CAP)
 
 
 def _reconnect_needs_attention(info: dict, now: float) -> bool:

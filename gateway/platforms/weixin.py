@@ -471,9 +471,38 @@ def _split_delivery_units_for_weixin(content: str) -> List[str]:
 
 def _looks_like_chatty_line_for_weixin(line: str) -> bool:
     stripped = line.strip()
-    return bool(
-        stripped and len(stripped) <= 48 and not line.startswith((" ", "\t")) and not stripped.startswith((">", "-", "*", "【", "#", "|"))
-        and not _TABLE_RULE_RE.match(stripped) and not re.match(r"^\*\*[^*]+\*\*$", stripped) and not re.match(r"^\d+\.\s", stripped))
+    if not stripped:
+        return False
+    if len(stripped) > 48:
+        return False
+    if line.startswith((" ", "\t")):
+        return False
+    if stripped.startswith((">", "-", "*", "【", "#", "|")):
+        return False
+    if _TABLE_RULE_RE.match(stripped):
+        return False
+    if re.match(r"^\*\*[^*]+\*\*$", stripped):
+        return False
+    if re.match(r"^\d+\.\s", stripped):
+        return False
+    # A line carrying inline markdown (backticks or ``**bold**``) is a
+    # structured payload (e.g. a ``/model`` list line of provider+models), not
+    # a bare chat utterance. Treating it as chatty made a 5-line ``/model``
+    # listing split into 5 bubbles. Any markdown-looking line votes the whole
+    # block non-chatty so it ships as a single message (requirement E).
+    if "`" in stripped or "**" in stripped:
+        return False
+    return True
+
+
+def _looks_like_heading_line_for_weixin(line: str) -> bool:
+    """Return True when a short line behaves like a heading."""
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if _HEADER_RE.match(stripped):
+        return True
+    return len(stripped) <= 24 and stripped.endswith((":", "："))
 
 
 def _should_split_short_chat_block_for_weixin(block: str) -> bool:
@@ -715,10 +744,23 @@ class WeixinAdapter(BasePlatformAdapter):
         self._send_chunk_delay_seconds = float(_extra_or_env(extra, "send_chunk_delay_seconds", "1.5"))
         self._send_chunk_retries = int(_extra_or_env(extra, "send_chunk_retries", "4"))
         self._send_chunk_retry_delay_seconds = float(_extra_or_env(extra, "send_chunk_retry_delay_seconds", "1.0"))
+        # Per-user send gate (requirement C): serialize sends to the SAME user
+        # without blocking other users. Multi-subscription / multi-cron bursts
+        # that all target one user would otherwise trip iLink's -2 rate limit.
+        self._send_gates: Dict[str, asyncio.Lock] = {}
+        # Adapter-wide gate serializing the actual iLink text calls across users
+        # (used by _send_text_chunk); per-user _send_gates already serialize same-user traffic.
         self._send_text_gate = asyncio.Lock()
+        self._user_last_send: Dict[str, float] = {}
+        self._send_user_min_interval_seconds = float(_extra_or_env(extra, "send_user_min_interval_seconds", "5.0"))
         self._rate_limit_circuit_threshold = max(1, int(_extra_or_env(extra, "rate_limit_circuit_threshold", "1")))
         self._rate_limit_circuit_window_seconds = float(_extra_or_env(extra, "rate_limit_circuit_window_seconds", "30.0"))
-        self._rate_limit_circuit_open_seconds = float(_extra_or_env(extra, "rate_limit_circuit_open_seconds", "30.0"))
+        # iLink's server-side window is >64s (measured). A local breaker that
+        # opened at 30s was SHORTER than the real window, so every retry during
+        # the server cooldown immediately re-opened the local breaker and the
+        # notifier burned 12 attempts into a wall. Default to 90s so the local
+        # cooldown outlasts the server window.
+        self._rate_limit_circuit_open_seconds = float(_extra_or_env(extra, "rate_limit_circuit_open_seconds", "90.0"))
         self._rate_limit_circuit_until, self._rate_limit_events = 0.0, []  # type: float, List[float]
         self._dm_policy = _extra_or_secret(extra, "dm_policy", "pairing").lower()
         self._group_policy = _extra_or_secret(extra, "group_policy", "disabled").lower()
@@ -747,6 +789,29 @@ class WeixinAdapter(BasePlatformAdapter):
         except (TypeError, ValueError):
             return float(default)
         return parsed if math.isfinite(parsed) and parsed >= 0 else float(default)
+
+    def _coerce_float_extra_or_env(self, key: str, env_key: str, default: float) -> float:
+        """Read a non-negative float from ``config.extra`` or an env var.
+
+        Same tolerance as :meth:`_coerce_float_extra` (bad/non-finite/negative
+        falls back to ``default``) but also honours an env override, so the
+        iLink circuit and per-user throttle can be tuned without editing
+        config.yaml. ``extra`` wins over ``env``.
+        """
+        import math
+
+        value = self.config.extra.get(key) if getattr(self.config, "extra", None) else None
+        if value is None:
+            value = os.getenv(env_key)
+        if value is None:
+            return float(default)
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return float(default)
+        if not math.isfinite(parsed) or parsed < 0:
+            return float(default)
+        return parsed
 
     @staticmethod
     def _coerce_list(value: Any) -> List[str]:
@@ -1018,10 +1083,30 @@ class WeixinAdapter(BasePlatformAdapter):
             self._rate_limit_circuit_until = max(self._rate_limit_circuit_until, time.monotonic() + self._rate_limit_circuit_open_seconds)
         return self._rate_limit_cooldown_remaining() > 0
 
+    def _reset_rate_limit_circuit(self) -> None:
+        self._rate_limit_events.clear()
+        self._rate_limit_circuit_until = 0.0
+
+    async def _wait_for_user_slot(self, user_id: str) -> None:
+        """Wait until ``send_user_min_interval_seconds`` have elapsed since the
+        last successful send to ``user_id``.
+
+        Runs under the per-user gate (``_send_gates``) so it only delays
+        further sends to the *same* user — other users proceed concurrently.
+        A per-user ``asyncio.sleep`` here is fine precisely because the gate is
+        per-user, not adapter-wide.
+        """
+        last = self._user_last_send.get(user_id, 0.0)
+        need = last + self._send_user_min_interval_seconds - time.monotonic()
+        if need > 0:
+            await asyncio.sleep(need)
+
     async def _send_text_chunk(self, *, chat_id: str, chunk: str, context_token: Optional[str], client_id: str) -> None:
         """Send one text chunk with retry/backoff under the adapter-wide text gate. On session-expired (errcode -14)
         retry once *without* ``context_token`` — iLink accepts tokenless sends as a degraded fallback, which keeps cron
-        pushes working when no user message refreshed the session."""
+        pushes working when no user message refreshed the session. Called while the caller (``send()``) holds the
+        per-user send gate, so same-user traffic is already serialized; the adapter-wide gate here only serializes
+        the actual iLink calls across users."""
         async with self._send_text_gate:
             last_error: Optional[Exception] = None
             retried_without_token = False
@@ -1072,6 +1157,28 @@ class WeixinAdapter(BasePlatformAdapter):
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         if not self._send_session or not self._token:
             return SendResult(success=False, error="Not connected")
+        # Per-user gate + throttle (requirement C): serialize sends to the SAME
+        # user and enforce a minimum interval between successful sends, WITHOUT
+        # blocking other users. Multi-subscription / multi-cron bursts that all
+        # target one user would otherwise trip iLink's -2 rate limit.
+        gate = self._send_gates.setdefault(chat_id, asyncio.Lock())
+        async with gate:
+            await self._wait_for_user_slot(chat_id)
+            return await self._send_after_gate(
+                chat_id=chat_id,
+                content=content,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+
+    async def _send_after_gate(
+        self,
+        *,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+    ) -> SendResult:
         context_token = self._token_store.get(self._account_id, chat_id)
         last_message_id: Optional[str] = None
         # Extract MEDIA: tags and bare local file paths before text delivery.
@@ -1094,6 +1201,7 @@ class WeixinAdapter(BasePlatformAdapter):
                 last_message_id = client_id
                 if idx < len(chunks) - 1 and self._send_chunk_delay_seconds > 0:
                     await asyncio.sleep(self._send_chunk_delay_seconds)
+            self._user_last_send[chat_id] = time.monotonic()
             return SendResult(success=True, message_id=last_message_id)
         except Exception as exc:
             logger.error("[%s] send failed to=%s: %s", self.name, _safe_id(chat_id), exc)

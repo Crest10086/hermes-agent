@@ -184,7 +184,12 @@ class CLIAgentSetupMixin:
         try:
             runtime = resolve_runtime_provider(
                 requested=self.requested_provider, explicit_api_key=self._explicit_api_key,
-                explicit_base_url=self._explicit_base_url)
+                explicit_base_url=self._explicit_base_url,
+                # Per-model api_mode routing (OpenCode Zen/Go) needs the EFFECTIVE model:
+                # with the config default model on a dual-surface provider the resolver
+                # would derive the default's api_mode, strip /v1 from the base URL, and a
+                # later -m switch to a chat_completions model would 404 (#t_561c24cb).
+                target_model=self.model or None)
         except Exception as exc:
             _primary_exc = exc
         if _primary_exc is not None:
@@ -330,7 +335,10 @@ class CLIAgentSetupMixin:
         try:
             runtime = resolve_runtime_provider(
                 requested=self.requested_provider, explicit_api_key=self._explicit_api_key,
-                explicit_base_url=self._explicit_base_url)
+                explicit_base_url=self._explicit_base_url,
+                # Match _ensure_runtime_credentials: per-model api_mode routing needs the
+                # effective model, not the config default.
+                target_model=self.model or None)
         except Exception:
             return False
         if not isinstance(runtime, dict):

@@ -7,8 +7,10 @@ per-subscription delivery (``_KanbanNotification``) live here.
 
 from __future__ import annotations
 
+import os
 import contextlib
 import re
+import time
 from functools import partial
 from pathlib import Path
 import weakref
@@ -51,6 +53,88 @@ _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "revie
 # every 5 seconds forever. A genuinely dead chat still drops, just ~60s later — a fine trade for an
 # unattended gate where a false drop means silent work pileup.
 MAX_SEND_FAILURES = 12
+
+# Long-notice file threshold (requirement D). When a notification's full body
+# exceeds this many chars, the notifier writes it to a .md document and sends a
+# short preview + the file instead of a wall of text on a phone.
+NOTICE_FILE_THRESHOLD = int(os.getenv("KANBAN_NOTICE_FILE_THRESHOLD", "1200"))
+NOTICE_PREVIEW_LEN = int(os.getenv("KANBAN_NOTICE_PREVIEW_LEN", "500"))
+
+
+def _is_transient_delivery_failure(exc: Exception) -> bool:
+    """True when a delivery error is a transient rate-limit (iLink -2).
+
+    A rate-limited send is *temporary*: the platform accepts once its window
+    resets, so it must NOT count toward the drop threshold. Only permanent,
+    unrecoverable failures (chat not found / session expired / authz revoked)
+    may drop a subscription after ``MAX_SEND_FAILURES`` consecutive attempts.
+    Matching is intentionally loose — the exact wording varies between the
+    cooldown path and the ``ret=-2`` path.
+    """
+    msg = str(exc).lower()
+    return "rate limited" in msg or "rate-limit" in msg or "cooldown" in msg
+
+
+def _notice_cache_dir() -> str:
+    """Resolve the kanban-notice cache directory (created lazily)."""
+    from hermes_constants import get_hermes_home
+    return os.path.join(str(get_hermes_home()), "cache", "kanban-notices")
+
+
+def _fileify_long_notice(
+    full_text: str,
+    task_id: str,
+    event_id: int,
+    *,
+    threshold: int,
+    preview_len: int = 500,
+    cache_dir: Optional[str] = None,
+) -> "tuple[str, Optional[str]]":
+    """When ``full_text`` is longer than ``threshold``, write the full text to
+    ``<cache_dir>/<task_id>-<event_id>.md`` and return a short preview plus that
+    file path for a ``send_document``.
+
+    The filename is keyed on the STABLE task-event id, not a wall-clock
+    timestamp: A's transient-failure rewind re-enters this function on every
+    retry tick, and a per-call ``time.time()`` name would drop a fresh
+    duplicate .md (identical content, new name) into the cache dir for as long
+    as iLink stays rate-limited — one e2e run left 128 files. Keying on
+    ``event_id`` makes retries overwrite the same file.
+
+    Returns ``(full_text, None)`` when the text fits within the threshold, so
+    short notifications keep the single-message path.
+    """
+    if not full_text or len(full_text) <= threshold:
+        return full_text, None
+    cache_dir = cache_dir or _notice_cache_dir()
+    os.makedirs(cache_dir, exist_ok=True)
+    path = os.path.join(cache_dir, f"{task_id}-{int(event_id)}.md")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(full_text)
+    preview = full_text[:preview_len].rstrip()
+    return f"{preview}\n\n…完整报告见附件", path
+
+
+def _fetch_completed_run_summary(board, task_id: str) -> "Optional[str]":
+    """Return the full summary from the task's most recent completed run.
+
+    The ``completed`` event payload only carries the first line capped at 400
+    chars; the full handoff summary lives on ``task_runs``. Long-notice
+    file-ification needs this full text to decide whether to ship the notice as
+    a .md document. Opens its own connection because the notifier's per-tick
+    worker runs after ``_collect`` has closed the board connection.
+    """
+    from hermes_cli import kanban_db as _kb
+    conn = _kb.connect(board=board)
+    try:
+        row = conn.execute(
+            "SELECT summary FROM task_runs WHERE task_id = ? AND outcome = 'completed' "
+            "AND summary IS NOT NULL AND summary != '' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    return row["summary"] if row else None
 
 _LOCAL_PATH_RE = re.compile(r"(?<![\w:/])(?:/(?:Users|home|private|tmp|var|etc|workspace)/[^\s,;]+|" r"[A-Za-z]:\\[^\s,;]+)")
 
@@ -310,8 +394,12 @@ def _fmt_completed(ev, n) -> tuple:
     payload_summary = _payload(ev, "summary")
     if payload_summary:
         wake_handoff = _first_line(str(payload_summary), 200)
+        # Full summary is the long-form notice: the event payload caps it at 400
+        # chars, so prefer the full run-summary text for the file-ification call.
+        n.notice_full = _fetch_completed_run_summary(n.board_slug, n.task_id) or str(payload_summary)
     elif n.task and n.task.result:
         wake_handoff = _first_line(n.task.result, 160)
+        n.notice_full = n.task.result
     handoff = f"\n{wake_handoff}" if wake_handoff is not None else ""
     return f"✔ {n.head} done — {n.title}{handoff}", wake_handoff, None
 
@@ -403,6 +491,8 @@ class _KanbanNotification:
         # Worker handoff carried into the synthetic wake turn so the woken
         # creator doesn't re-decompose work already on the board.
         self.wake_handoff = self.wake_review_detail = self.session_key = self.synth = ""
+        # Full summary text for long-notice file-ification (requirement D).
+        self.notice_full: Optional[str] = None
         self.plat: Any = None
         self.adapter: Any = None
         self.is_push_adapter = True
@@ -426,6 +516,16 @@ class _KanbanNotification:
 
     async def delivery_failed(self, fmt: str, prefix: tuple, drop_fmt: str, exc: Exception, exc_info: bool) -> None:
         """Bump the failure counter; drop the sub past the limit, else rewind the claim so the next tick retries."""
+        if _is_transient_delivery_failure(exc):
+            # Rate-limited / cooldown: temporary — rewind the claim and retry on
+            # the next tick WITHOUT counting toward the drop threshold, so a live
+            # sub survives any amount of rate-limiting.
+            logger.warning(
+                "kanban notifier: transient send failure for %s on %s (rate limited; rewinding for retry): %s",
+                self.task_id, self.platform_str, exc,
+            )
+            await self.rewind()
+            return
         fails = self.sub_fail_counts.get(self.sub_key, 0) + 1
         self.sub_fail_counts[self.sub_key] = fails
         logger.warning(fmt, *prefix, fails, MAX_SEND_FAILURES, exc, exc_info=exc_info)
@@ -540,12 +640,30 @@ class _KanbanNotification:
         metadata: dict[str, Any] = dict(delivery_metadata) if isinstance(delivery_metadata, dict) else {}
         if sub.get("thread_id") and not metadata.get("thread_id"):
             metadata["thread_id"] = sub["thread_id"]
-        _send_res = await adapter.send(sub["chat_id"], msg, metadata=metadata)
+        # Requirement D: if the long-form notice (full summary) exceeds the file
+        # threshold, ship it as a .md document instead of a wall of text on a
+        # phone. Short notices keep the existing single-message path verbatim.
+        send_text = msg
+        notice_file: Optional[str] = None
+        if self.notice_full and len(self.notice_full) > NOTICE_FILE_THRESHOLD:
+            # Key the .md filename on the stable event id (not a timestamp) so
+            # A's transient-failure rewind, which re-runs this send site every
+            # retry tick, overwrites one file instead of dropping a fresh
+            # duplicate per tick.
+            send_text, notice_file = _fileify_long_notice(
+                self.notice_full, self.task_id, ev.id,
+                threshold=NOTICE_FILE_THRESHOLD, preview_len=NOTICE_PREVIEW_LEN,
+            )
+        _send_res = await adapter.send(sub["chat_id"], send_text, metadata=metadata)
         # SendResult(success=False) without an exception is a FAILED delivery
         # (else the event is lost); None / non-SendResult keeps the
         # "no exception == delivered" contract.
         if getattr(_send_res, "success", True) is False:
             raise RuntimeError(f"adapter send() reported failure: {getattr(_send_res, 'error', None) or 'unknown error'}")
+        if notice_file:
+            _file_res = await adapter.send_document(chat_id=sub["chat_id"], file_path=notice_file, metadata=metadata)
+            if getattr(_file_res, "success", True) is False:
+                raise RuntimeError(f"adapter send_document() reported failure: {getattr(_file_res, 'error', None) or 'unknown error'}")
         logger.debug("kanban notifier: delivered %s event for %s to %s/%s on board %s",
                      ev.kind, self.task_id, self.platform_str, sub["chat_id"], self.board_slug)
         # Upload artifact paths from the completion payload / legacy result as

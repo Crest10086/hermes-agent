@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from agent.i18n import t
 from gateway.kanban_watchers_common import (
     _acquire_singleton_lock,
     _kanban_dispatch_allowed,

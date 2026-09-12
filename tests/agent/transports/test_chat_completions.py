@@ -370,7 +370,9 @@ class TestChatCompletionsBuildKwargs:
             base_url="https://api.mistral.ai/v1",
         )
         assert kw.get("extra_body", {}).get("think") is None
-        assert kw.get("reasoning_effort") == "none"
+        # Regression t_91f9aae7: the disabled literal must never leak to a
+        # non-Ollama custom endpoint — EXL3-class backends 400 on "none".
+        assert "reasoning_effort" not in kw
 
 
 
@@ -1036,3 +1038,70 @@ class TestPromptCacheKeyCapability:
             request_overrides={"prompt_cache_key": "   "},
         )
         assert "prompt_cache_key" not in kwargs
+
+
+class TestCustomProfileNoReasoningEffortNoneLeak:
+    """Regression for t_91f9aae7: the custom profile must NEVER put a top-level
+    ``reasoning_effort: "none"`` on the wire for non-Ollama endpoints.
+
+    Worker crash evidence: custom:new-api→EXL3 (127.0.0.1:3140) rejected
+    ``reasoning_effort: none`` with ``TemplateError: Unexpected reasoning
+    effort none. Supported types are xhigh (default), medium, and low.`` →
+    HTTP 400 → non-retryable → worker crash. The disabled/eoff-none
+    reasoning_config reaches the profile from the nudge/continuation path
+    (``turn_truncation._ephemeral_reasoning_off`` → ``_reasoning_config_for_wire``).
+    """
+
+    def _build(self, transport, **extra):
+        from providers import get_provider_profile
+
+        profile = get_provider_profile("custom")
+        kwargs = transport.build_kwargs(
+            model="local-main",
+            messages=[{"role": "user", "content": "continue"}],
+            tools=[],
+            reasoning_config={"enabled": False, "effort": "none"},
+            supports_reasoning=True,
+            provider_profile=profile,
+            provider_name="custom",
+            base_url="http://127.0.0.1:3140/v1",
+            **extra,
+        )
+        return kwargs
+
+    def test_disabled_reasoning_never_emits_top_level_none(self, transport):
+        kwargs = self._build(transport)
+        # The exact crash shape: 400 `TemplateError: Unexpected reasoning effort none`.
+        assert "reasoning_effort" not in kwargs, kwargs
+        eb = kwargs.get("extra_body") or {}
+        assert "reasoning_effort" not in eb
+        assert eb.get("reasoning") != {"enabled": False, "effort": "none"}
+        # Server default reasoning applies — no request-scoped disable at all.
+        assert eb.get("think") is not False
+
+    def test_disabled_reasoning_still_omitted_with_nudge_path_config(self, transport):
+        """The ephemeral continuation override shape (enabled=False+effort=none) —
+        exactly what _reasoning_config_for_wire produces after a thinking-only
+        truncation — must not leak `none` either."""
+        kwargs = self._build(transport)
+        assert "reasoning_effort" not in kwargs
+        top_keys = set(kwargs)
+        assert not any(k == "reasoning_effort" for k in top_keys)
+
+    def test_ollama_disabled_still_emits_duo(self, transport):
+        """Ollama endpoints keep the documented disable pair — unchanged."""
+        from providers import get_provider_profile
+
+        profile = get_provider_profile("custom")
+        kwargs = transport.build_kwargs(
+            model="qwen3",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            reasoning_config={"enabled": False},
+            supports_reasoning=True,
+            provider_profile=profile,
+            provider_name="custom",
+            base_url="http://127.0.0.1:11434/v1",
+        )
+        assert kwargs.get("reasoning_effort") == "none"
+        assert (kwargs.get("extra_body") or {}).get("think") is False

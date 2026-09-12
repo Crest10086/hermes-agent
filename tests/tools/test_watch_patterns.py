@@ -295,15 +295,20 @@ class TestTerminalToolSchema:
             _, kwargs = mock_tt.call_args
             assert kwargs.get("watch_patterns") == ["ERR"]
 
-    def test_foreground_watch_patterns_rejected_with_teaching_error(self):
-        """Background-only modifiers on a foreground call fail loud with the
-        corrected call shape instead of being silently ignored."""
+    def test_foreground_watch_patterns_auto_promoted_to_background(self):
+        """A foreground call carrying a notify-class modifier is the classic
+        mis-send: auto-promote to background instead of erroring, so the model
+        isn't bounced back for forgetting background=true."""
         from tools.terminal_tool import _handle_terminal
-        result = json.loads(
-            _handle_terminal({"command": "echo hi", "watch_patterns": ["ERR"]}, task_id="t1")
-        )
-        assert "error" in result
-        assert "background=true" in result["error"]
+        with patch("tools.terminal_tool.terminal_tool") as mock_tt:
+            mock_tt.return_value = json.dumps({"output": "ok", "exit_code": 0})
+            result = json.loads(
+                _handle_terminal({"command": "echo hi", "watch_patterns": ["ERR"]}, task_id="t1")
+            )
+        assert "error" not in result
+        _, kwargs = mock_tt.call_args
+        assert kwargs.get("background") is True
+        assert kwargs.get("watch_patterns") == ["ERR"]
 
 
 # =========================================================================
