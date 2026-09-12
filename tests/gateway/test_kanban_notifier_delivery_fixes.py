@@ -2,7 +2,7 @@ import asyncio
 import os
 
 from gateway.config import Platform
-from gateway.kanban_watchers import _fileify_long_notice
+from gateway.kanban_watchers_notifier import _fileify_long_notice
 from gateway.run import GatewayRunner
 from hermes_cli import kanban_db as kb
 
