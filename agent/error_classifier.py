@@ -141,6 +141,28 @@ _OVERLOADED_PATTERNS = (
     "at capacity", "over capacity",
 )
 
+# TabbyAPI / exllamav3-style KV-cache capacity rejection. The engine reports a
+# page/context allocation failure whose "context size" substring (a member of
+# _CONTEXT_OVERFLOW_PATTERNS) would otherwise be matched as a context overflow —
+# but the request is small, so compressing the prompt cannot free KV-cache
+# pages. The correct recovery is to back off and retry once the engine frees
+# pages (or lower max_seq_len / grow the cache), never to delete conversation
+# history on a phantom overflow. Local repro (2026-09-09 15:02, patrol-t cron
+# for t_14951f7f, ~7.3K-token prompt on a 245,760-token window):
+#   "Job requires 968 pages (only 960 available) and cannot be enqueued. Total
+#    cache allocated is 960 * 256 = 245760 tokens. The request exceeds the
+#    available context size."
+_KV_CACHE_CAPACITY_PATTERNS = (
+    "cannot be enqueued",
+    "cache allocated",
+    "pages (only",
+    "kvcache",
+    "kv cache",
+    "kv-cache",
+    "cache is full",
+    "cache slot",
+)
+
 # Usage-limit patterns that need disambiguation (billing OR rate_limit), and
 # the signals that mark such a limit as transient (periodic quota, not billing).
 _USAGE_LIMIT_PATTERNS = ("usage limit", "quota", "limit exceeded", "key limit exceeded")
@@ -641,7 +663,12 @@ def _by_message(c: _Ctx) -> Optional[Verdict]:
     if head is not None:
         return head
     usage_limit = any(p in c.msg for p in _USAGE_LIMIT_PATTERNS)
-    return _classify_402(c.msg, dict) if usage_limit else _first_match(c.msg, _MESSAGE_TAIL_RULES)
+    if usage_limit:
+        return _classify_402(c.msg, dict)
+    kv = _kv_cache_capacity_verdict(c)
+    if kv is not None:
+        return kv
+    return _first_match(c.msg, _MESSAGE_TAIL_RULES)
 
 
 def _by_transport(c: _Ctx) -> Optional[Verdict]:
@@ -768,6 +795,9 @@ def _status_5xx(c: _Ctx) -> Verdict:
     validation = any(p in c.msg for p in _REQUEST_VALIDATION_PATTERNS) or c.code in _5XX_VALIDATION_CODES
     if validation and not _is_server_injected_param_rejection(c.msg, c.provider_slug):
         return _V_FORMAT_ERROR
+    kv = _kv_cache_capacity_verdict(c)
+    if kv is not None:
+        return kv
     return _first_match(c.msg, _OVERFLOW_AS_5XX_RULES) or _V_SERVER_ERROR
 
 
@@ -777,6 +807,39 @@ def _classify_402(error_msg: str, result_fn: Callable[..., Any]) -> Any:
         p in error_msg for p in _USAGE_LIMIT_TRANSIENT_SIGNALS
     )
     return result_fn(**(_V_RATE_LIMIT if transient else _V_BILLING))
+
+
+def _kv_cache_capacity_verdict(c: _Ctx) -> Optional[Verdict]:
+    """Guard against server-side KV-cache capacity rejections being mistaken
+    for a context overflow.
+
+    TabbyAPI / exllamav3 report a page-allocation failure that contains the
+    overflow-flavored wording "…exceeds the available context size." Pattern
+    matching (``_CONTEXT_OVERFLOW_PATTERNS`` includes "context size") would
+    route that into compression — but the request is small, so compressing the
+    prompt cannot free KV-cache pages. The correct recovery is to back off and
+    retry once the engine frees pages (or lower max_seq_len / grow the cache),
+    never to delete conversation history on a phantom overflow.
+
+    Recognised only when the message carries an explicit KV-cache capacity
+    signal **and** the session is not genuinely large, so a true overflow on a
+    big session still routes to compression. Returns the ``overloaded`` verdict
+    (retryable, no compression) for a confirmed capacity rejection, else None.
+    """
+    if not any(p in c.msg for p in _KV_CACHE_CAPACITY_PATTERNS):
+        return None
+    # A genuinely large session may reflect a real overflow → keep compression.
+    is_large = c.approx_tokens > c.context_length * 0.6 or (
+        c.context_length <= 256000 and c.approx_tokens > 120000
+    )
+    if is_large:
+        return None
+    logger.info(
+        "KV-cache capacity rejection (not context overflow): approx_tokens=%d "
+        "context_length=%d reason=%s", c.approx_tokens, c.context_length,
+        FailoverReason.overloaded.value,
+    )
+    return _V_OVERLOADED
 
 
 def _classify_400(c: _Ctx) -> Verdict:
@@ -822,6 +885,9 @@ def _classify_400(c: _Ctx) -> Verdict:
     # 400 whose wording a proxy stripped would fall through to format_error.
     if code in _MEMORY_CEILING_ERROR_CODES:
         return _V_OVERLOADED
+    kv = _kv_cache_capacity_verdict(c)
+    if kv is not None:
+        return kv
     verdict = _first_match(msg, _400_TAIL_RULES)
     if verdict is not None:
         return verdict
@@ -843,8 +909,8 @@ _STATUS_HANDLERS: Dict[int, Callable[[_Ctx], Verdict]] = {
     403: _status_403, 404: _status_404, 408: lambda c: _V_TIMEOUT, 413: lambda c: _V_PAYLOAD_TOO_LARGE,
     422: lambda c: _first_match(c.msg, _IMAGE_TOOL_RULES) or _V_FORMAT_ERROR,
     429: _status_429, 500: _status_5xx, 502: _status_5xx,
-    503: lambda c: _first_match(c.msg, _OVERFLOW_AS_5XX_RULES) or _V_OVERLOADED,
-    529: lambda c: _first_match(c.msg, _OVERFLOW_AS_5XX_RULES) or _V_OVERLOADED,
+    503: lambda c: _kv_cache_capacity_verdict(c) or _first_match(c.msg, _OVERFLOW_AS_5XX_RULES) or _V_OVERLOADED,
+    529: lambda c: _kv_cache_capacity_verdict(c) or _first_match(c.msg, _OVERFLOW_AS_5XX_RULES) or _V_OVERLOADED,
 }
 
 
