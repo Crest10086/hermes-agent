@@ -66,6 +66,18 @@ def test_insufficient_length_does_not_trip():
     assert find_loop_segment(text) is None
 
 
+def test_one_char_changed_is_not_a_loop():
+    # The user's definition: completely identical repetition. Flip a single
+    # character in the middle copy -> no longer an exact loop.
+    seg = _unique_paragraph()
+    idx = len(seg) // 2
+    flipped = ("X" if seg[idx] != "X" else "Y")
+    corrupted = seg[:idx] + flipped + seg[idx + 1 :]
+    text = "PFX " + seg + corrupted + seg
+    assert find_loop_segment(text) is None
+    assert not is_reasoning_loop(text)
+
+
 def test_collapse_removes_the_loop():
     seg = _unique_paragraph()
     text = "PFX " + seg + seg + seg

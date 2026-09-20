@@ -4,10 +4,12 @@ Detects a dead loop in a model's streaming reasoning (the thinking block),
 collapses it to a single copy, and hands a clean version to the next call so
 the loop does not re-seed itself into the context.
 
-Conservative by design: only a LONG segment (>= ``min_segment_len``) repeated
-back-to-back (>= ``min_repeats``) with high similarity trips it. Legitimate
-long reasoning that revisits ideas with intervening new content should NOT
-trip it — the requirement is 宁可漏报早期, 不误杀 xhigh 的合法长推理.
+Definition (per the user): a dead loop is the thinking chain being generated
+repeatedly and EXACTLY — a single changed character disqualifies it. Detection
+is therefore exact-match periodicity, not fuzzy similarity: a long segment
+(>= ``min_segment_len``) repeated back-to-back (>= ``min_repeats``) byte-for-byte.
+This is maximally conservative — no false positives from near-matches on xhigh
+reasoning that merely revisits phrasing.
 
 This module is pure / self-contained (no core imports) so it is immune to
 update conflicts and trivial to rebase. The thin core integration (stream-hook
@@ -16,13 +18,11 @@ feed + interrupt + re-prompt) lives elsewhere and stays small.
 from __future__ import annotations
 
 import threading
-import time
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 DEFAULT_MIN_SEGMENT_LEN = 400
 DEFAULT_MIN_REPEATS = 3
-DEFAULT_SIMILARITY = 0.97
 DEFAULT_MAX_BUFFER = 4000
 DEFAULT_CHECK_EVERY = 200
 
@@ -34,17 +34,15 @@ def find_loop_segment(
     *,
     min_segment_len: int = DEFAULT_MIN_SEGMENT_LEN,
     min_repeats: int = DEFAULT_MIN_REPEATS,
-    similarity: float = DEFAULT_SIMILARITY,
 ) -> Optional[Tuple[str, int]]:
-    """Return ``(segment, repeat_count)`` if the TAIL of ``text`` is back-to-back
-    near-verbatim repetition of a segment of length >= ``min_segment_len``, else
+    """Return ``(segment, repeat_count)`` if the TAIL of ``text`` is an EXACT
+    back-to-back repetition of a segment of length >= ``min_segment_len``, else
     None.
 
-    Models the dead-loop shape: the trailing region is periodic with period ``p``
-    (``p >= min_segment_len``) at >= ``similarity`` over ``min_repeats`` copies.
-    Scans ``p`` small-to-large and returns the tightest qualifying period. The
-    positional periodicity comparison (``text[i]`` vs ``text[i+p]``) is tolerant
-    to a few characters of drift, unlike exact non-overlapping-copy matching.
+    Models the dead-loop shape: the trailing region is byte-for-byte periodic
+    with period ``p`` (``p >= min_segment_len``) over ``min_repeats`` copies.
+    Scans ``p`` small-to-large and returns the tightest (smallest) exact period.
+    A single changed character anywhere in the repeated region disqualifies it.
     """
     n = len(text)
     if n < min_segment_len * min_repeats:
@@ -53,21 +51,12 @@ def find_loop_segment(
     if max_p < min_segment_len:
         return None
     for p in range(min_segment_len, max_p + 1):
-        base = text[n - p:]
-        # Cheap pre-screen: a 30-char anchor of the base must recur earlier in
-        # the buffer (before the last copy) before we pay for the scan.
-        anchor = base[:30]
-        if anchor not in text[: n - p]:
+        # Cheap necessary check: the last two p-copies must be identical.
+        if text[n - 2 * p : n - p] != text[n - p : n]:
             continue
-        region_lo = n - min_repeats * p
-        hi = n - p
-        if hi <= region_lo:
-            continue
-        a = text[region_lo:hi]
-        b = text[region_lo + p:hi + p]
-        match = sum(1 for x, y in zip(a, b) if x == y)
-        if match / len(a) >= similarity:
-            return base, min_repeats
+        # Full check: the entire trailing region is periodic with period p.
+        if text[n - min_repeats * p : n - p] == text[n - min_repeats * p + p : n]:
+            return text[n - p :], min_repeats
     return None
 
 
@@ -76,14 +65,10 @@ def is_reasoning_loop(
     *,
     min_segment_len: int = DEFAULT_MIN_SEGMENT_LEN,
     min_repeats: int = DEFAULT_MIN_REPEATS,
-    similarity: float = DEFAULT_SIMILARITY,
 ) -> bool:
-    """True when ``text`` ends in a detected reasoning loop."""
+    """True when ``text`` ends in an exact reasoning loop."""
     return find_loop_segment(
-        text,
-        min_segment_len=min_segment_len,
-        min_repeats=min_repeats,
-        similarity=similarity,
+        text, min_segment_len=min_segment_len, min_repeats=min_repeats
     ) is not None
 
 
@@ -92,7 +77,6 @@ def collapse_reasoning(
     *,
     min_segment_len: int = DEFAULT_MIN_SEGMENT_LEN,
     min_repeats: int = DEFAULT_MIN_REPEATS,
-    similarity: float = DEFAULT_SIMILARITY,
 ) -> Tuple[str, int]:
     """Collapse a detected loop to ``prefix + one copy of the segment + marker``.
 
@@ -101,10 +85,7 @@ def collapse_reasoning(
     loop, so replaying it into the next call does not re-seed the repetition.
     """
     found = find_loop_segment(
-        text,
-        min_segment_len=min_segment_len,
-        min_repeats=min_repeats,
-        similarity=similarity,
+        text, min_segment_len=min_segment_len, min_repeats=min_repeats
     )
     if not found:
         return text, 0
@@ -125,13 +106,13 @@ class _SessionState:
 
 
 class ReasoningLoopWatchdog:
-    """Per-session streaming-reasoning loop detector.
+    """Per-session streaming-reasoning loop detector (exact-match).
 
     ``feed(session_id, delta)`` accumulates reasoning deltas and, once enough
-    new text has arrived since the last check, runs the conservative detector.
-    It returns a loop-info dict on a confirmed loop (only once per generation),
-    else None. ``reset(session_id)`` clears state for a new generation — call it
-    on stream start.
+    new text has arrived since the last check, runs the detector. Returns a
+    loop-info dict on a confirmed loop (only once per generation), else None.
+    ``reset(session_id)`` clears state for a new generation — call it on stream
+    start.
 
     The loop-info dict carries: ``session_id``, ``segment``, ``repeat_count``,
     ``collapsed`` (cleaned reasoning), and ``raw_tail`` (the buffered tail).
@@ -142,13 +123,11 @@ class ReasoningLoopWatchdog:
         *,
         min_segment_len: int = DEFAULT_MIN_SEGMENT_LEN,
         min_repeats: int = DEFAULT_MIN_REPEATS,
-        similarity: float = DEFAULT_SIMILARITY,
         max_buffer: int = DEFAULT_MAX_BUFFER,
         check_every: int = DEFAULT_CHECK_EVERY,
     ):
         self.min_segment_len = min_segment_len
         self.min_repeats = min_repeats
-        self.similarity = similarity
         self.max_buffer = max_buffer
         self.check_every = check_every
         self._states: Dict[str, _SessionState] = {}
@@ -160,12 +139,9 @@ class ReasoningLoopWatchdog:
         with self._lock:
             self._states.pop(session_id, None)
 
-    def feed(
-        self, session_id: str, delta: str, now: Optional[float] = None
-    ) -> Optional[dict]:
+    def feed(self, session_id: str, delta: str) -> Optional[dict]:
         if not session_id or not delta:
             return None
-        del now  # reserved for future throttling; kept for call-site stability
         with self._lock:
             st = self._states.get(session_id)
             if st is None:
@@ -183,7 +159,6 @@ class ReasoningLoopWatchdog:
                 st.buffer,
                 min_segment_len=self.min_segment_len,
                 min_repeats=self.min_repeats,
-                similarity=self.similarity,
             )
             if not found:
                 return None
@@ -193,7 +168,6 @@ class ReasoningLoopWatchdog:
                 st.buffer,
                 min_segment_len=self.min_segment_len,
                 min_repeats=self.min_repeats,
-                similarity=self.similarity,
             )
             return {
                 "session_id": session_id,
@@ -211,7 +185,6 @@ __all__ = [
     "collapse_reasoning",
     "DEFAULT_MIN_SEGMENT_LEN",
     "DEFAULT_MIN_REPEATS",
-    "DEFAULT_SIMILARITY",
     "DEFAULT_MAX_BUFFER",
     "DEFAULT_CHECK_EVERY",
     "LOOP_MARKER",
