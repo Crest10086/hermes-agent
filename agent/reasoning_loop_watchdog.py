@@ -6,10 +6,16 @@ the loop does not re-seed itself into the context.
 
 Definition (per the user): a dead loop is the thinking chain being generated
 repeatedly and EXACTLY — a single changed character disqualifies it. Detection
-is therefore exact-match periodicity, not fuzzy similarity: a long segment
-(>= ``min_segment_len``) repeated back-to-back (>= ``min_repeats``) byte-for-byte.
-This is maximally conservative — no false positives from near-matches on xhigh
-reasoning that merely revisits phrasing.
+is therefore exact-match periodicity, not fuzzy similarity. Two tiers, either
+of which qualifies:
+
+  * a segment of >= 20 chars repeated back-to-back >= 5 times, OR
+  * a segment of >= 100 chars repeated back-to-back >= 3 times.
+
+The tightest (smallest) qualifying period wins, so the collapse keeps the
+atomic loop unit (20 or 100 chars worth), not a bloated block that already
+contains several sub-loops. This is maximally conservative — no false positives
+from near-matches on xhigh reasoning that merely revisits phrasing.
 
 This module is pure / self-contained (no core imports) so it is immune to
 update conflicts and trivial to rebase. The thin core integration (stream-hook
@@ -21,8 +27,8 @@ import threading
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
-DEFAULT_MIN_SEGMENT_LEN = 400
-DEFAULT_MIN_REPEATS = 3
+# (min_segment_len, min_repeats) tiers. Sorted ascending by min_segment_len.
+DEFAULT_TIERS: Tuple[Tuple[int, int], ...] = ((20, 5), (100, 3))
 DEFAULT_MAX_BUFFER = 4000
 DEFAULT_CHECK_EVERY = 200
 
@@ -32,61 +38,72 @@ LOOP_MARKER = "\n[reasoning loop collapsed: {n} repeated segments removed]"
 def find_loop_segment(
     text: str,
     *,
-    min_segment_len: int = DEFAULT_MIN_SEGMENT_LEN,
-    min_repeats: int = DEFAULT_MIN_REPEATS,
+    tiers: Tuple[Tuple[int, int], ...] = DEFAULT_TIERS,
 ) -> Optional[Tuple[str, int]]:
     """Return ``(segment, repeat_count)`` if the TAIL of ``text`` is an EXACT
-    back-to-back repetition of a segment of length >= ``min_segment_len``, else
-    None.
+    back-to-back repetition matching any tier, else None.
 
-    Models the dead-loop shape: the trailing region is byte-for-byte periodic
-    with period ``p`` (``p >= min_segment_len``) over ``min_repeats`` copies.
-    Scans ``p`` small-to-large and returns the tightest (smallest) exact period.
+    For each tier ``(min_len, min_repeats)`` the trailing region must be
+    byte-for-byte periodic with period ``p >= min_len`` over at least
+    ``min_repeats`` copies. The smallest qualifying ``p`` across all tiers wins
+    (the atomic loop unit). ``repeat_count`` is the ACTUAL number of trailing
+    copies (>= the tier minimum), so the collapse keeps exactly one copy.
     A single changed character anywhere in the repeated region disqualifies it.
     """
     n = len(text)
-    if n < min_segment_len * min_repeats:
-        return None
-    max_p = n // min_repeats
-    if max_p < min_segment_len:
-        return None
-    for p in range(min_segment_len, max_p + 1):
-        # Cheap necessary check: the last two p-copies must be identical.
-        if text[n - 2 * p : n - p] != text[n - p : n]:
+    best_p: Optional[int] = None
+    for min_len, min_repeats in tiers:
+        if n < min_len * min_repeats:
             continue
-        # Full check: the entire trailing region is periodic with period p.
-        if text[n - min_repeats * p : n - p] == text[n - min_repeats * p + p : n]:
-            return text[n - p :], min_repeats
-    return None
+        max_p = n // min_repeats
+        if max_p < min_len:
+            continue
+        for p in range(min_len, max_p + 1):
+            base = text[n - p:]
+            # Cheap necessary check: the immediately-preceding p-block is
+            # identical to the last one (find is C-speed, no full-region alloc).
+            if text.find(base, n - 2 * p, n - p) != n - 2 * p:
+                continue
+            # Full check: the trailing region is exactly min_repeats copies.
+            if text[n - min_repeats * p : n] == base * min_repeats:
+                if best_p is None or p < best_p:
+                    best_p = p
+                break  # smallest p for this tier
+    if best_p is None:
+        return None
+    base = text[n - best_p:]
+    # Count the ACTUAL number of trailing copies (may exceed the tier minimum).
+    count = 1
+    pos = n - best_p
+    while pos - best_p >= 0 and text[pos - best_p : pos] == base:
+        count += 1
+        pos -= best_p
+    return base, count
 
 
 def is_reasoning_loop(
     text: str,
     *,
-    min_segment_len: int = DEFAULT_MIN_SEGMENT_LEN,
-    min_repeats: int = DEFAULT_MIN_REPEATS,
+    tiers: Tuple[Tuple[int, int], ...] = DEFAULT_TIERS,
 ) -> bool:
     """True when ``text`` ends in an exact reasoning loop."""
-    return find_loop_segment(
-        text, min_segment_len=min_segment_len, min_repeats=min_repeats
-    ) is not None
+    return find_loop_segment(text, tiers=tiers) is not None
 
 
 def collapse_reasoning(
     text: str,
     *,
-    min_segment_len: int = DEFAULT_MIN_SEGMENT_LEN,
-    min_repeats: int = DEFAULT_MIN_REPEATS,
+    tiers: Tuple[Tuple[int, int], ...] = DEFAULT_TIERS,
 ) -> Tuple[str, int]:
     """Collapse a detected loop to ``prefix + one copy of the segment + marker``.
 
     Returns ``(collapsed, repeat_count)``. When no loop is detected, returns
-    ``(text, 0)`` unchanged. The collapsed result is deliberately no longer a
-    loop, so replaying it into the next call does not re-seed the repetition.
+    ``(text, 0)`` unchanged. Because ``repeat_count`` is the actual number of
+    trailing copies, the prefix excludes every copy and exactly one copy is
+    retained — so replaying the result into the next call does not re-seed the
+    repetition.
     """
-    found = find_loop_segment(
-        text, min_segment_len=min_segment_len, min_repeats=min_repeats
-    )
+    found = find_loop_segment(text, tiers=tiers)
     if not found:
         return text, 0
     segment, count = found
@@ -106,7 +123,7 @@ class _SessionState:
 
 
 class ReasoningLoopWatchdog:
-    """Per-session streaming-reasoning loop detector (exact-match).
+    """Per-session streaming-reasoning loop detector (exact-match, tiered).
 
     ``feed(session_id, delta)`` accumulates reasoning deltas and, once enough
     new text has arrived since the last check, runs the detector. Returns a
@@ -121,13 +138,11 @@ class ReasoningLoopWatchdog:
     def __init__(
         self,
         *,
-        min_segment_len: int = DEFAULT_MIN_SEGMENT_LEN,
-        min_repeats: int = DEFAULT_MIN_REPEATS,
+        tiers: Tuple[Tuple[int, int], ...] = DEFAULT_TIERS,
         max_buffer: int = DEFAULT_MAX_BUFFER,
         check_every: int = DEFAULT_CHECK_EVERY,
     ):
-        self.min_segment_len = min_segment_len
-        self.min_repeats = min_repeats
+        self.tiers = tiers
         self.max_buffer = max_buffer
         self.check_every = check_every
         self._states: Dict[str, _SessionState] = {}
@@ -155,20 +170,12 @@ class ReasoningLoopWatchdog:
             st.last_checked_len = len(st.buffer)
             if st.fired:
                 return None
-            found = find_loop_segment(
-                st.buffer,
-                min_segment_len=self.min_segment_len,
-                min_repeats=self.min_repeats,
-            )
+            found = find_loop_segment(st.buffer, tiers=self.tiers)
             if not found:
                 return None
             st.fired = True
             segment, count = found
-            collapsed, _ = collapse_reasoning(
-                st.buffer,
-                min_segment_len=self.min_segment_len,
-                min_repeats=self.min_repeats,
-            )
+            collapsed, _ = collapse_reasoning(st.buffer, tiers=self.tiers)
             return {
                 "session_id": session_id,
                 "segment": segment,
@@ -183,8 +190,7 @@ __all__ = [
     "find_loop_segment",
     "is_reasoning_loop",
     "collapse_reasoning",
-    "DEFAULT_MIN_SEGMENT_LEN",
-    "DEFAULT_MIN_REPEATS",
+    "DEFAULT_TIERS",
     "DEFAULT_MAX_BUFFER",
     "DEFAULT_CHECK_EVERY",
     "LOOP_MARKER",
