@@ -1,5 +1,7 @@
 """Tests for the reasoning-loop watchdog: detector, collapse, state machine."""
+import random
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -80,6 +82,45 @@ def test_below_20char_not_detected():
     seg = _atomic(15)  # 15-char unit, below the 20-char floor
     text = "pre " + seg * 8
     assert find_loop_segment(text) is None
+
+
+def _randomish(n: int, seed: int = 20260921) -> str:
+    # n-char string with (astronomically unlikely) no exact period — for
+    # large-scale tests where _atomic's 94-cycle would introduce a sub-period.
+    rnd = random.Random(seed)
+    alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    return "".join(rnd.choice(alphabet) for _ in range(n))
+
+
+def test_tiny_scale_20char_x6_detected():
+    # Extremely small scale: a 20-char unit repeated 6x (more than the tier-1
+    # minimum of 5). Actual-count must report 6, and collapse keeps one copy.
+    seg = _atomic(20)
+    text = "pre " + seg * 6
+    found = find_loop_segment(text)
+    assert found is not None
+    segment, count = found
+    assert len(segment) == 20
+    assert count == 6
+    collapsed, cc = collapse_reasoning(text)
+    assert cc == 6
+    assert collapsed.count(seg) == 1
+
+
+def test_large_scale_1000char_x3_detected():
+    # Extremely large length: a 1000-char unit repeated 3x (3000 chars total).
+    # Verifies the detector finds the large period and stays fast enough for a
+    # background thread.
+    seg = _randomish(1000)
+    text = "pre " + seg * 3
+    t0 = time.perf_counter()
+    found = find_loop_segment(text)
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    assert found is not None
+    segment, count = found
+    assert len(segment) == 1000
+    assert count == 3
+    assert elapsed_ms < 250, f"detection too slow: {elapsed_ms:.1f}ms"
 
 
 # --- Realistic long-reasoning loop ----------------------------------------
