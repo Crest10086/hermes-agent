@@ -40,6 +40,11 @@ from agent.gemini_native_adapter import is_native_gemini_base_url
 from agent.model_metadata import is_local_endpoint
 from agent.message_content import flatten_message_text
 from agent.message_metadata import append_message, stamp_message_timestamp
+from agent.reasoning_loop_recovery import (
+    generation_start as _rl_generation_start,
+    feed_reasoning as _rl_feed_reasoning,
+    arm_recovery as _rl_arm_recovery,
+)
 from agent.message_sanitization import (
     _sanitize_surrogates, _repair_tool_call_arguments, normalize_finish_reason as _normalize_finish_reason,
     sanitize_outbound_kwargs,
@@ -3052,6 +3057,13 @@ class _StreamingCall(StreamingWaitMonitor):
                     reasoning_parts[-1] if reasoning_parts else "", reasoning_text)
                 reasoning_parts.append(reasoning_text)
                 self._emit_reasoning(reasoning_text)
+                # Reasoning-loop watchdog: feed the delta; on a confirmed exact
+                # loop, arm the recovery and break the stream early (the .run()
+                # wrapper then raises InterruptedError -> handle_api_interrupt).
+                _rl_hit = _rl_feed_reasoning(self.agent, reasoning_text)
+                if _rl_hit is not None:
+                    _rl_arm_recovery(self.agent, _rl_hit)
+                    break
             # Structured reasoning_details deltas carry the provider's replay data; the
             # non-streaming path already keeps them, so dropping them here lost
             # reasoning continuity on nearly every turn. Pydantic parks unknown fields
@@ -3728,6 +3740,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     streaming codex runner; cron turns and delegated children run inline."""
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted before streaming API call")
+    _rl_generation_start(agent)  # fresh detection buffer for this generation
     if agent.api_mode == "codex_responses":
         return _stream_codex_passthrough(agent, api_kwargs, on_first_delta)
     if agent.api_mode == "bedrock_converse":

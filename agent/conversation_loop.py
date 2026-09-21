@@ -1615,6 +1615,8 @@ def run_conversation(
     """
     from agent.turn_context import export_current_turn_boundary
     from tools.vision_tools_history_budget import native_turn_images
+    from agent.reasoning_loop_recovery import reset_for_turn as _rl_reset_for_turn
+    _rl_reset_for_turn(agent)  # fresh escalation counter for this turn
 
     # Images attached natively to this user turn stay visible to vision_analyze for the turn, so
     # it does not embed the same pixels a second time into the same request (#76411).

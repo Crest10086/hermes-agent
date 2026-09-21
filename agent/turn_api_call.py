@@ -176,6 +176,7 @@ def handle_api_interrupt(
     queued for the outer-loop rebuild; otherwise keep any streamed partial text so the next
     turn has a record of the half-finished reply."""
     from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
+    from agent.reasoning_loop_recovery import handle_in_interrupt as _rl_handle_in_interrupt
 
     thinking_spinner = stop_thinking_spinner(agent, thinking_spinner)
     # redirect() cancelled only this request: keep the correction queued, clear the
@@ -184,6 +185,13 @@ def handle_api_interrupt(
     if agent._has_pending_redirect() and agent.clear_interrupt(preserve_redirect=True):
         _retry.restart_with_redirected_messages = True
         return ApiInterruptVerdict("break", thinking_spinner, interrupted, final_response)
+    # Reasoning-loop recovery: an armed loop-break re-prompts (falls through to
+    # the next API call on the cleaned context) instead of ending the turn.
+    # Takes precedence over the generic partial-text handling below.
+    _rl_action = _rl_handle_in_interrupt(agent, messages)
+    if _rl_action is not None:
+        agent._persist_session(messages, conversation_history)
+        return ApiInterruptVerdict(_rl_action, thinking_spinner, interrupted, final_response)
     api_elapsed = time.time() - api_start_time
     agent._vprint(f"{agent.log_prefix}⚡ Interrupted during API call.", force=True)
     interrupted = True
