@@ -128,6 +128,7 @@ def arm_recovery(agent, loop_info: dict) -> Optional[str]:
         agent._reasoning_loop_breaks = breaks + 1
     else:
         mode = None  # exhausted: interrupt but no re-prompt
+        agent._reasoning_loop_breaks = breaks + 1
     agent._interrupt_requested = True  # always break the stream early
     if mode is not None:
         agent._ephemeral_reasoning_off = (mode == "A")
@@ -138,6 +139,24 @@ def arm_recovery(agent, loop_info: dict) -> Optional[str]:
         }
     else:
         agent._reasoning_loop_recovery = None
+    # Observability: one greppable line per break. The recovery branch in
+    # handle_api_interrupt returns before the generic "⚡ Interrupted" print,
+    # so without this a loop event would leave no trace in the gateway log.
+    try:
+        seg = loop_info.get("segment", "") or ""
+        note = {
+            "B": "re-thinking on collapsed context (thinking stays on)",
+            "A": "disabling thinking to force the final answer",
+            None: "loop persists; ending the turn",
+        }[mode]
+        agent._vprint(
+            f"{agent.log_prefix}🔁 [reasoning-loop] break {breaks + 1} "
+            f"(mode {mode or 'exhausted'}): {len(seg)}-char segment repeated "
+            f"{loop_info.get('repeat_count', '?')}x exactly -> {note}",
+            force=True,
+        )
+    except Exception:
+        pass
     return mode
 
 
